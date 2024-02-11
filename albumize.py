@@ -30,7 +30,7 @@ if __name__ == "__main__":
             thumb_url = thumb_future.result()
             lines.append(f'<a href="{full_url}"><img src="{thumb_url}"></a>')
 
-    output_filename = f"{sys.argv[1]}---{sys.argv[-1]}.html"
+    output_filename = f"{Path(sys.argv[1]).stem}---{Path(sys.argv[-1]).stem}.html"
 
     tmp = Path("/tmp")
     with open(tmp / output_filename, "w") as f:
