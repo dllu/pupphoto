@@ -9,7 +9,6 @@ Image.MAX_IMAGE_PIXELS = None  # suppress stupid decompression bomb warning
 
 def upload_photo(src_file, resize=None):
     src_path = Path(src_file)
-    print("uploading", src_path)
 
     dir_name = src_path.parent
     # filename = src_path.name
