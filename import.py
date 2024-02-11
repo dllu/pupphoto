@@ -77,7 +77,7 @@ def copy_and_rename_files(source, destination):
 
     # Process files with progress bar
     raw_files = list(source.glob("*.*"))
-    for raw_file_path in tqdm(raw_files, desc="Processing images"):
+    for raw_file_path in tqdm(raw_files, desc="Processing images", dynamic_ncols=True):
         if raw_file_path.suffix.lower() == ".jpg":
             has_raw_file = 0
             for raw_suffix in supported_raw_formats:
