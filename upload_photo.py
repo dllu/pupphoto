@@ -2,16 +2,20 @@ import hashlib
 import subprocess
 import sys
 from pathlib import Path
+import pyexiv2
 from PIL import Image, ImageOps
+import shutil
+
+from remove_gps_if_banned import remove_gps_if_banned
 
 Image.MAX_IMAGE_PIXELS = None  # suppress stupid decompression bomb warning
 
 
 def upload_photo(src_file, resize=None):
     src_path = Path(src_file)
+    thumb_path = Path("/home/dllu/pictures/thumbs")
 
-    dir_name = src_path.parent
-    # filename = src_path.name
+    filename = src_path.name
     filename_no_ext = src_path.stem
     ext = src_path.suffix
 
@@ -19,14 +23,24 @@ def upload_photo(src_file, resize=None):
         img = Image.open(src_file)
         img = ImageOps.exif_transpose(img)
         img.thumbnail((resize, resize), Image.Resampling.LANCZOS)
+
         resized_filename = f"{filename_no_ext}_{resize}{ext}"
-        src = dir_name / resized_filename  # Temporary file path
-        img.save(src, quality=95)
+        upload_src = thumb_path / resized_filename  # Temporary file path
+
+        img.save(upload_src, quality=95)
+
     else:
-        src = src_path
+        upload_src = thumb_path / filename  # Temporary file path
+        shutil.copyfile(src_path, upload_src)
+
+    metadata = pyexiv2.ImageMetadata(str(upload_src))
+    metadata.read()
+    gps_banned = remove_gps_if_banned(metadata)
+    if gps_banned:
+        metadata.write()
 
     # Calculate SHA1 checksum
-    with open(src, "rb") as f:
+    with open(upload_src, "rb") as f:
         sha1 = hashlib.sha1(f.read()).hexdigest()
     dst_filename = f"{filename_no_ext}_{sha1[:16]}{ext}"
     dst = f"b2:dllu-pics/{dst_filename}"
@@ -36,7 +50,7 @@ def upload_photo(src_file, resize=None):
     dst_url = f"https://i.dllu.net/{dst_filename}"
     if dst_filename not in result.stdout:
         # Upload the file
-        subprocess.run(["rclone", "copyto", src, dst])
+        subprocess.run(["rclone", "copyto", upload_src, dst])
     return dst_url
 
 
