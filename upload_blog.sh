@@ -30,5 +30,14 @@ desc="$exif_make $exif_model with $exif_lens, $exif_fl, $exif_aperture, $exif_ss
 # Output the sentence with both links
 output="pic $resized_link : $desc (full size: $full_size_link)"
 
-echo $output | xclip -selection c
+if [ "$WAYLAND_DISPLAY" ]; then
+    # Wayland: Use wl-copy
+    echo "$output" | wl-copy
+elif [ "$DISPLAY" ]; then
+    # X11: Use xclip
+    echo "$output" | xclip -selection c
+else
+    echo "Error: Unable to detect display server. Clipboard not updated." >&2
+    exit 1
+fi
 echo $output
