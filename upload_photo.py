@@ -6,7 +6,7 @@ import pyexiv2
 from PIL import Image, ImageOps
 import shutil
 
-from remove_gps_if_banned import remove_gps_if_banned
+from gps import remove_gps_if_banned
 
 Image.MAX_IMAGE_PIXELS = None  # suppress stupid decompression bomb warning
 
