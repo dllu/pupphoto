@@ -8,7 +8,16 @@ if [ -z "$1" ]; then
     exit 1
 fi
 
-echo "" | xclip -selection c
+if [ "$WAYLAND_DISPLAY" ]; then
+    # Wayland: Use wl-copy
+    echo "" | wl-copy
+elif [ "$DISPLAY" ]; then
+    # X11: Use xclip
+    echo "" | xclip -selection c
+else
+    echo "Error: Unable to detect display server. Clipboard not updated." >&2
+    exit 1
+fi
 
 # Call the upload function with the provided arguments
 if [ -n "$2" ]; then
