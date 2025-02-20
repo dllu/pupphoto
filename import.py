@@ -7,6 +7,8 @@ import hashlib
 import shutil
 import pyexiv2
 from tqdm import tqdm
+import datetime
+import os
 
 
 # Compute SHA1 hash of a file
@@ -15,37 +17,39 @@ def sha1sum(filename: Path):
         return hashlib.file_digest(f, "sha1").hexdigest()
 
 
-# Extract the datetime from the EXIF data using exiv2
+# Extract the datetime from the EXIF data using pyexiv2
 def get_exif_datetime(image_path: Path):
     try:
         exif_data = pyexiv2.ImageMetadata(str(image_path))
         exif_data.read()
         datetime_original = exif_data["Exif.Photo.DateTimeOriginal"].value
         return datetime_original.strftime("%Y-%m-%d-%H-%M-%S")
-    except KeyError:
-        return None
-    except IOError:
+    except (KeyError, IOError):
         return None
 
 
-# Check if file already exists with the same date and filename prefix
+# Check if a file with the same date and filename prefix already exists
 def file_already_exists(destination: Path, filename_prefix: str):
     return any(destination.glob(f"{filename_prefix}*"))
 
 
 @dataclass
 class Summary:
-    skipped_files: List[str] = field(default_factory=list)
+    skipped_photo_files: List[str] = field(default_factory=list)
+    successful_photo_import: List[str] = field(default_factory=list)
+    skipped_video_files: List[str] = field(default_factory=list)
+    successful_video_import: List[str] = field(default_factory=list)
     no_jpeg_files: List[str] = field(default_factory=list)
     no_raw_files: List[str] = field(default_factory=list)
     invalid_exif_files: List[str] = field(default_factory=list)
     unsupported_files: List[str] = field(default_factory=list)
-    successful_import: List[str] = field(default_factory=list)
 
     def __repr__(self):
         out = [
-            f"Successfully imported: {len(self.successful_import)}",
-            f"Total files skipped (already existing): {len(self.skipped_files)}",
+            f"Successfully imported photos: {len(self.successful_photo_import)}",
+            f"Total photo files skipped (already existing): {len(self.skipped_photo_files)}",
+            f"Successfully imported videos: {len(self.successful_video_import)}",
+            f"Total video files skipped (already existing): {len(self.skipped_video_files)}",
         ]
 
         def print_files(files):
@@ -58,7 +62,7 @@ class Summary:
             out.append("JPEG files with no corresponding raw file:")
             out.append(print_files(self.no_raw_files))
         if self.invalid_exif_files:
-            out.append("Files with no valid exif")
+            out.append("Files with no valid EXIF:")
             out.append(print_files(self.invalid_exif_files))
         if self.unsupported_files:
             out.append("Unsupported files:")
@@ -67,72 +71,85 @@ class Summary:
         return "\n".join(out)
 
 
-# Main function to copy and rename files
-def copy_and_rename_files(source, destination):
-    destination.mkdir(parents=True, exist_ok=True)
+def copy_and_rename_files(source, photo_destination, video_destination):
+    # Ensure destination directories exist
+    photo_destination.mkdir(parents=True, exist_ok=True)
+    video_destination.mkdir(parents=True, exist_ok=True)
 
+    # Define supported formats
     supported_raw_formats = [".raf", ".dng", ".cr3", ".arw"]
+    supported_video_formats = [".mov", ".mp4", ".avi", ".mkv"]
 
     summary = Summary()
 
-    # Process files with progress bar
-    raw_files = list(source.glob("*.*"))
-    for raw_file_path in tqdm(raw_files, desc="Processing images", dynamic_ncols=True):
-        if raw_file_path.suffix.lower() == ".jpg":
-            has_raw_file = 0
-            for raw_suffix in supported_raw_formats:
-                if raw_file_path.with_suffix(raw_suffix.upper()).exists():
-                    has_raw_file += 1
-            if has_raw_file == 0:
-                summary.no_raw_files.append(raw_file_path)
-            if has_raw_file == 1:
-                # everything good, continue
+    # Process all files in the source directory
+    for file_path in tqdm(
+        list(source.glob("*.*")), desc="Processing files", dynamic_ncols=True
+    ):
+        suffix = file_path.suffix.lower()
+
+        if suffix in supported_video_formats:
+            # Handle video files
+            mtime = os.path.getmtime(file_path)
+            datetime_taken = datetime.datetime.fromtimestamp(mtime).strftime(
+                "%Y-%m-%d-%H-%M-%S"
+            )
+            sha1 = sha1sum(file_path)
+            new_base_filename = f"{datetime_taken}_{file_path.stem}"
+            if file_already_exists(video_destination, new_base_filename):
+                summary.skipped_video_files.append(str(file_path))
                 continue
-            if has_raw_file > 1:
-                print(f"Multiple raw files found for {raw_file_path}")
+            new_filename = f"{new_base_filename}_{sha1}{suffix}"
+            shutil.copy2(file_path, video_destination / new_filename)
+            summary.successful_video_import.append(str(file_path))
 
-        if raw_file_path.suffix.lower() not in supported_raw_formats:
-            summary.unsupported_files.append(raw_file_path.name)
-            continue
+        elif suffix == ".jpg":
+            # Handle JPEG files (check for corresponding RAW)
+            has_raw_file = sum(
+                1
+                for raw_suffix in supported_raw_formats
+                if file_path.with_suffix(raw_suffix.upper()).exists()
+            )
+            if has_raw_file == 0:
+                summary.no_raw_files.append(str(file_path))
+            elif has_raw_file > 1:
+                print(f"Multiple raw files found for {file_path}")
 
-        jpg_file_path = raw_file_path.with_suffix(".JPG")
-        if not jpg_file_path.exists():
-            summary.no_jpeg_files.append(raw_file_path.name)
-            continue
+        elif suffix in supported_raw_formats:
+            # Handle RAW files
+            jpg_file_path = file_path.with_suffix(".JPG")
+            if not jpg_file_path.exists():
+                summary.no_jpeg_files.append(file_path.name)
+                continue
+            datetime_taken = get_exif_datetime(jpg_file_path)
+            if not datetime_taken:
+                summary.invalid_exif_files.append(jpg_file_path.name)
+                continue
+            new_base_filename = f"{datetime_taken}_{file_path.stem}"
+            if file_already_exists(photo_destination, new_base_filename):
+                summary.skipped_photo_files.append(str(file_path))
+                continue
+            sha1 = sha1sum(file_path)
+            new_filename = f"{new_base_filename}_{sha1}"
+            shutil.copy2(jpg_file_path, photo_destination / f"{new_filename}.jpg")
+            shutil.copy2(file_path, photo_destination / f"{new_filename}{suffix}")
+            summary.successful_photo_import.append(str(file_path))
 
-        datetime_taken = get_exif_datetime(jpg_file_path)
-        if not datetime_taken:
-            summary.invalid_exif_files.append(jpg_file_path.name)
-            continue
-
-        new_base_filename = f"{datetime_taken}_{raw_file_path.stem}"
-        if file_already_exists(destination, new_base_filename):
-            summary.skipped_files.append(raw_file_path)
-            continue
-
-        # Compute SHA1 of the raw file
-        sha1 = sha1sum(raw_file_path)
-        new_filename = f"{new_base_filename}_{sha1}"
-
-        # Copy and rename JPEG file
-        shutil.copy2(jpg_file_path, destination / f"{new_filename}.jpg")
-        # Copy and rename raw file
-        shutil.copy2(
-            raw_file_path, destination / f"{new_filename}{raw_file_path.suffix.lower()}"
-        )
-        summary.successful_import.append(raw_file_path)
+        else:
+            summary.unsupported_files.append(file_path.name)
 
     print(summary)
 
 
 def main():
     camera_dir = Path("/mnt/camera/DCIM")
-    destination_dir = Path("/home/dllu/pictures/raw")
+    photo_destination = Path("/home/dllu/pictures/raw")
+    video_destination = Path("/home/dllu/videos")
 
-    # Iterate over all source directories found by globbing /mnt/camera/DCIM/*
+    # Process each subdirectory in the camera directory
     for source_dir in camera_dir.glob("*/"):
         if source_dir.is_dir():
-            copy_and_rename_files(source_dir, destination_dir)
+            copy_and_rename_files(source_dir, photo_destination, video_destination)
 
 
 if __name__ == "__main__":
