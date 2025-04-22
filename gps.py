@@ -1,11 +1,17 @@
-from math import radians, sin, cos, sqrt, atan2
+from math import atan2, cos, radians, sin, sqrt
+from pathlib import Path
+from typing import Optional, Tuple
+
 import pyexiv2
 import yaml
-from typing import Optional, Tuple
 
 
 # Load banned areas from YAML file
-def load_banned_areas(yaml_path="/home/dllu/proj/pupphoto/banned_areas.yaml"):
+def load_banned_areas(yaml_path=None):
+    if yaml_path is None:
+        yaml_path = Path(__file__).parent / "banned_areas.yaml"
+    else:
+        yaml_path = Path(yaml_path)
     with open(yaml_path, "r") as file:
         data = yaml.safe_load(file)
     return data["banned_areas"]
