@@ -1,19 +1,32 @@
 import hashlib
+import shutil
 import subprocess
 import sys
 from pathlib import Path
+
 import pyexiv2
 from PIL import Image, ImageOps
-import shutil
 
 from gps import remove_gps_if_banned
 
 Image.MAX_IMAGE_PIXELS = None  # suppress stupid decompression bomb warning
 
 
+def get_xdg_user_dir(name: str, fallback: Path) -> Path:
+    try:
+        output = subprocess.check_output(["xdg-user-dir", name], text=True).strip()
+        if output:
+            return Path(output)
+    except Exception:
+        pass
+    return fallback
+
+
 def upload_photo(src_file, resize=None):
     src_path = Path(src_file)
-    thumb_path = Path("/home/dllu/pictures/thumbs")
+    pictures_dir = get_xdg_user_dir("PICTURES", Path.home() / "Pictures")
+    thumb_path = pictures_dir / "thumbs"
+    thumb_path.mkdir(exist_ok=True, parents=True)
 
     filename = src_path.name
     filename_no_ext = src_path.stem
