@@ -4,7 +4,6 @@ import subprocess
 import sys
 from pathlib import Path
 
-import pyexiv2
 from PIL import Image, ImageOps
 
 from gps import remove_gps_if_banned
@@ -46,11 +45,7 @@ def upload_photo(src_file, resize=None):
         upload_src = thumb_path / filename  # Temporary file path
         shutil.copyfile(src_path, upload_src)
 
-    metadata = pyexiv2.ImageMetadata(str(upload_src))
-    metadata.read()
-    gps_banned = remove_gps_if_banned(metadata)
-    if gps_banned:
-        metadata.write()
+    gps_banned = remove_gps_if_banned(upload_src)
 
     # Calculate SHA1 checksum
     with open(upload_src, "rb") as f:

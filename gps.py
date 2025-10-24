@@ -2,8 +2,9 @@ from math import atan2, cos, radians, sin, sqrt
 from pathlib import Path
 from typing import Optional, Tuple
 
-import pyexiv2
 import yaml
+import subprocess
+import re
 
 
 # Load banned areas from YAML file
@@ -40,45 +41,86 @@ def is_in_banned_area(lat, lon):
     return False
 
 
-def lat_lon_from_metadata(
-    metadata: pyexiv2.ImageMetadata,
-) -> Optional[Tuple[float, float]]:
-    gps_lat = metadata.get("Exif.GPSInfo.GPSLatitude")
-    gps_lon = metadata.get("Exif.GPSInfo.GPSLongitude")
-    gps_lat_ref = metadata.get("Exif.GPSInfo.GPSLatitudeRef")
-    gps_lon_ref = metadata.get("Exif.GPSInfo.GPSLongitudeRef")
-
-    if gps_lat and gps_lon and gps_lat_ref and gps_lon_ref:
-        gps_lat = gps_lat.value
-        gps_lon = gps_lon.value
-        gps_lat_ref = gps_lat_ref.value
-        gps_lon_ref = gps_lon_ref.value
-
-        lat_deg = gps_lat[0] + gps_lat[1] / 60 + gps_lat[2] / 3600
-        lon_deg = gps_lon[0] + gps_lon[1] / 60 + gps_lon[2] / 3600
-    else:
+def lat_lon_from_metadata(image_path: str) -> Optional[Tuple[float, float]]:
+    """
+    Extract latitude and longitude from image metadata using exiv2 CLI.
+    Returns (lat, lon) in decimal degrees or None if not available.
+    """
+    path = str(image_path)
+    try:
+        raw_lat = subprocess.check_output(
+            ["exiv2", "-g", "Exif.GPSInfo.GPSLatitude", "-Pv", path], text=True
+        ).strip()
+        raw_lon = subprocess.check_output(
+            ["exiv2", "-g", "Exif.GPSInfo.GPSLongitude", "-Pv", path], text=True
+        ).strip()
+        lat_ref = subprocess.check_output(
+            ["exiv2", "-g", "Exif.GPSInfo.GPSLatitudeRef", "-Pv", path], text=True
+        ).strip()
+        lon_ref = subprocess.check_output(
+            ["exiv2", "-g", "Exif.GPSInfo.GPSLongitudeRef", "-Pv", path], text=True
+        ).strip()
+    except subprocess.CalledProcessError:
         return None
 
-    if gps_lat_ref != "N":
-        lat_deg = -lat_deg
-    if gps_lon_ref != "E":
-        lon_deg = -lon_deg
+    if not raw_lat or not raw_lon or not lat_ref or not lon_ref:
+        return None
 
-    return (float(lat_deg), float(lon_deg))
+    nums_lat = re.findall(r"[-+]?\d*\.\d+|\d+", raw_lat)
+    nums_lon = re.findall(r"[-+]?\d*\.\d+|\d+", raw_lon)
+    if len(nums_lat) < 3 or len(nums_lon) < 3:
+        return None
+    try:
+        d_lat, m_lat, s_lat = map(float, nums_lat[:3])
+        d_lon, m_lon, s_lon = map(float, nums_lon[:3])
+    except ValueError:
+        return None
+
+    lat = d_lat + m_lat / 60 + s_lat / 3600
+    lon = d_lon + m_lon / 60 + s_lon / 3600
+
+    if lat_ref.upper() != "N":
+        lat = -lat
+    if lon_ref.upper() != "E":
+        lon = -lon
+
+    return (lat, lon)
 
 
 # Function to remove GPS data if within banned area
-def remove_gps_if_banned(metadata: pyexiv2.ImageMetadata) -> bool:
-    lat_lon = lat_lon_from_metadata(metadata)
-    if lat_lon is None:
+def remove_gps_if_banned(image_path: str) -> bool:
+    """
+    Remove GPS metadata tags if image taken within a banned area.
+    Returns True if metadata was modified.
+    """
+    path = str(image_path)
+    coords = lat_lon_from_metadata(path)
+    if coords is None:
         return False
-    lat_deg, lon_deg = lat_lon
+    lat, lon = coords
 
-    if is_in_banned_area(lat_deg, lon_deg):
-        # Clear GPS info from the metadata
-        keys_to_delete = [key for key in metadata if key.startswith("Exif.GPSInfo")]
-        for key in keys_to_delete:
-            del metadata[key]
+    if is_in_banned_area(lat, lon):
+        try:
+            output = subprocess.check_output(
+                ["exiv2", "-g", "Exif.GPSInfo", "-pa", path], text=True
+            )
+        except subprocess.CalledProcessError:
+            return False
+
+        tags_to_delete = []
+        for line in output.splitlines():
+            parts = line.split()
+            if parts:
+                tag = parts[0]
+                if tag.startswith("Exif.GPSInfo"):
+                    tags_to_delete.append(tag)
+
+        for tag in tags_to_delete:
+            subprocess.run(
+                ["exiv2", "-M", f"del {tag}", path],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
         return True
 
     return False

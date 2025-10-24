@@ -5,7 +5,7 @@ from typing import List
 from pathlib import Path
 import hashlib
 import shutil
-import pyexiv2
+import subprocess
 from tqdm import tqdm
 import datetime
 import os
@@ -17,14 +17,18 @@ def sha1sum(filename: Path):
         return hashlib.file_digest(f, "sha1").hexdigest()
 
 
-# Extract the datetime from the EXIF data using pyexiv2
+# Extract the datetime from the EXIF data using exiv2 CLI
 def get_exif_datetime(image_path: Path):
     try:
-        exif_data = pyexiv2.ImageMetadata(str(image_path))
-        exif_data.read()
-        datetime_original = exif_data["Exif.Photo.DateTimeOriginal"].value
-        return datetime_original.strftime("%Y-%m-%d-%H-%M-%S")
-    except (KeyError, IOError):
+        output = subprocess.check_output(
+            ["exiv2", "-g", "Exif.Photo.DateTimeOriginal", "-Pv", str(image_path)],
+            text=True,
+        ).strip()
+        if not output:
+            return None
+        dt = datetime.datetime.strptime(output, "%Y:%m:%d %H:%M:%S")
+        return dt.strftime("%Y-%m-%d-%H-%M-%S")
+    except (subprocess.CalledProcessError, ValueError):
         return None
 
 

@@ -1,14 +1,11 @@
 #!/usr/bin/env python3
 
-import pyexiv2
 import webbrowser
 from gps import lat_lon_from_metadata
 
 
 def open_location_in_maps(image_path: str):
-    metadata = pyexiv2.ImageMetadata(image_path)
-    metadata.read()
-    lat_lon = lat_lon_from_metadata(metadata)
+    lat_lon = lat_lon_from_metadata(image_path)
 
     if lat_lon:
         lat, lon = lat_lon
