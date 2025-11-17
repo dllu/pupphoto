@@ -53,12 +53,9 @@ def upload_photo(src_file, resize=None):
     dst_filename = f"{filename_no_ext}_{sha1[:16]}{ext}"
     dst = f"b2:dllu-pics/{dst_filename}"
 
-    # Check if the file exists on the remote and upload it if necessary
-    result = subprocess.run(["rclone", "lsf", dst], capture_output=True, text=True)
+    # Upload file, skipping if it already exists remotely
     dst_url = f"https://i.dllu.net/{dst_filename}"
-    if dst_filename not in result.stdout:
-        # Upload the file
-        subprocess.run(["rclone", "copyto", upload_src, dst])
+    subprocess.run(["rclone", "copyto", "--ignore-existing", upload_src, dst])
     return dst_url
 
 
