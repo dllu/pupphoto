@@ -1,4 +1,6 @@
+import argparse
 import hashlib
+import os
 import shutil
 import subprocess
 import sys
@@ -21,7 +23,24 @@ def get_xdg_user_dir(name: str, fallback: Path) -> Path:
     return fallback
 
 
-def upload_photo(src_file, resize=None):
+def copy_to_clipboard(text: str) -> bool:
+    if os.environ.get("WAYLAND_DISPLAY"):
+        cmd = ["wl-copy"]
+    elif os.environ.get("DISPLAY"):
+        cmd = ["xclip", "-selection", "c"]
+    else:
+        print("Error: Unable to detect display server. Clipboard not updated.", file=sys.stderr)
+        return False
+
+    try:
+        subprocess.run(cmd, input=text, text=True, check=True)
+    except (OSError, subprocess.CalledProcessError):
+        print("Error: Clipboard command failed.", file=sys.stderr)
+        return False
+    return True
+
+
+def upload_photo(src_file, resize=None, clipboard=False, clipboard_format=None):
     src_path = Path(src_file)
     pictures_dir = get_xdg_user_dir("PICTURES", Path.home() / "Pictures")
     thumb_path = pictures_dir / "thumbs"
@@ -55,13 +74,33 @@ def upload_photo(src_file, resize=None):
 
     # Upload file, skipping if it already exists remotely
     dst_url = f"https://i.dllu.net/{dst_filename}"
+    if clipboard or clipboard_format is not None:
+        clipboard_text = dst_url if clipboard_format is None else clipboard_format.format(url=dst_url)
+        if not copy_to_clipboard(clipboard_text):
+            raise SystemExit(1)
     subprocess.run(["rclone", "copyto", "--ignore-existing", upload_src, dst])
     return dst_url
 
 
 if __name__ == "__main__":
-    if len(sys.argv) == 2:
-        dst = upload_photo(sys.argv[1])
-    elif len(sys.argv) == 3:
-        dst = upload_photo(sys.argv[1], resize=int(sys.argv[2]))
+    parser = argparse.ArgumentParser(description="Upload a photo and output its public URL.")
+    parser.add_argument("src_file")
+    parser.add_argument("resize", nargs="?", type=int)
+    parser.add_argument(
+        "--clipboard",
+        action="store_true",
+        help="Copy the URL to the clipboard before uploading.",
+    )
+    parser.add_argument(
+        "--clipboard-format",
+        help="Format string for clipboard text (use {url}). Implies --clipboard.",
+    )
+    args = parser.parse_args()
+
+    dst = upload_photo(
+        args.src_file,
+        resize=args.resize,
+        clipboard=args.clipboard or args.clipboard_format is not None,
+        clipboard_format=args.clipboard_format,
+    )
     print(dst)
