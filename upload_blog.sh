@@ -1,7 +1,6 @@
 #!/bin/bash
 
 script_dir=$(cd "$(dirname "$0")" && pwd)
-source "$script_dir/clipboard.sh" || exit 1
 
 # uploads a photo and copies the url to clipboard
 
@@ -13,10 +12,8 @@ fi
 
 dest_dir=${2:-/home/dllu/proj/daniel.lawrence.lu/img}
 
-clipboard_clear || exit 1
-
 # Upload the full-size photo
-full_size_link=$(python "$script_dir/upload_photo.py" "$1")
+full_size_link=$(python "$script_dir/upload_photo.py" --clipboard-format "pic {url} : " "$1") || exit 1
 
 # Extract hashed filename from the URL
 dst_filename=$(echo "$full_size_link" | sed 's#.*/##')
@@ -40,8 +37,6 @@ rsync -a "$processed_path" "$dest_file"
 
 # Output the sentence with both links
 output="pic $full_size_link : "
-
-clipboard_copy "$output" || exit 1
 echo "$output"
 
 echo "Copied $processed_path to $dest_file"

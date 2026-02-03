@@ -1,7 +1,6 @@
 #!/bin/bash
 
 script_dir=$(cd "$(dirname "$0")" && pwd)
-source "$script_dir/clipboard.sh" || exit 1
 
 # uploads a photo and copies the url to clipboard
 
@@ -11,15 +10,12 @@ if [ -z "$1" ]; then
     exit 1
 fi
 
-clipboard_clear || exit 1
-
 # Call the upload function with the provided arguments
 if [ -n "$2" ]; then
     # If a resize argument is provided
-    output=$(python "$script_dir/upload_photo.py" "$1" "$2")
+    output=$(python "$script_dir/upload_photo.py" --clipboard "$1" "$2") || exit 1
 else
     # If only the file path is provided
-    output=$(python "$script_dir/upload_photo.py" "$1")
+    output=$(python "$script_dir/upload_photo.py" --clipboard "$1") || exit 1
 fi
-
-clipboard_copy "$output" || exit 1
+echo "$output"
