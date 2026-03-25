@@ -176,6 +176,12 @@ def _parse_exiv2_float(value: str | None, suffix: str = "") -> float | None:
     cleaned = value.removeprefix("F").strip()
     if suffix and cleaned.endswith(suffix):
         cleaned = cleaned[: -len(suffix)].strip()
+    rational_match = re.search(r"([-+]?\d+(?:\.\d+)?)\s*/\s*([-+]?\d+(?:\.\d+)?)", cleaned)
+    if rational_match:
+        numerator = float(rational_match.group(1))
+        denominator = float(rational_match.group(2))
+        if denominator != 0:
+            return numerator / denominator
     match = re.search(r"[-+]?\d+(?:\.\d+)?", cleaned)
     if not match:
         return None
@@ -491,7 +497,11 @@ class VisionClient:
         self.client = OpenAI(api_key=config.api_key)
 
     def propose_metadata(
-        self, image_data_url: str, metadata: PhotoMetadata, suffix_hint: str
+        self,
+        image_data_url: str,
+        metadata: PhotoMetadata,
+        suffix_hint: str,
+        user_hint: str,
     ) -> dict[str, Any]:
         print(
             "Requesting filename, caption, and category search hints from OpenAI...",
@@ -543,7 +553,9 @@ class VisionClient:
                             "text": "Image metadata JSON:\n"
                             + json.dumps(
                                 metadata.to_model_dict(), indent=2, sort_keys=True
-                            ),
+                            )
+                            + "\n\nOptional user hint:\n"
+                            + (user_hint or "(none)"),
                         },
                         {
                             "type": "input_image",
@@ -564,6 +576,7 @@ class VisionClient:
         proposed_caption: str,
         proposed_summary: str,
         category_graph: dict[str, Any],
+        user_hint: str,
     ) -> dict[str, Any]:
         print("Requesting final category selection from OpenAI...", flush=True)
         schema = {
@@ -610,6 +623,8 @@ class VisionClient:
                             + proposed_caption
                             + "\n\nVisual summary:\n"
                             + proposed_summary
+                            + "\n\nOptional user hint:\n"
+                            + (user_hint or "(none)")
                             + "\n\nCandidate category graph JSON:\n"
                             + json.dumps(category_graph, indent=2, sort_keys=True),
                         },
@@ -807,15 +822,6 @@ def _free_port(host: str) -> int:
 
 
 def _html_page(state: dict[str, Any]) -> str:
-    categories_html = "".join(
-        (
-            '<div class="category-row">'
-            f'<input type="text" value="{escape(category)}" class="category-input">'
-            '<button type="button" class="remove-btn">Remove</button>'
-            "</div>"
-        )
-        for category in state["categories"]
-    )
     return f"""<!doctype html>
 <html lang="en">
 <head>
@@ -956,16 +962,34 @@ def _html_page(state: dict[str, Any]) -> str:
       <div class="meta"><strong>Metadata</strong><pre>{escape(json.dumps(state["metadata"], indent=2, sort_keys=True))}</pre></div>
     </section>
     <section class="card form-card">
-      <h1>Review Commons Upload</h1>
-      <label for="filename">Filename</label>
-      <input id="filename" type="text" value="{escape(state["filename"])}">
-      <label for="caption">Caption</label>
-      <textarea id="caption">{escape(state["caption"])}</textarea>
-      <label>Categories</label>
-      <div id="categories">{categories_html}</div>
-      <button type="button" class="secondary" id="add-category">Add category</button>
+      <div id="hint-stage">
+        <h1>Prepare Commons Upload</h1>
+        <p>Add an optional hint if the model may struggle to identify the subject, location, event, or other context from the image alone.</p>
+        <label for="hint">Hint</label>
+        <textarea id="hint" placeholder="Optional: identify the subject, place, event, or any other context for the AI."></textarea>
+        <div class="actions">
+          <button type="button" class="primary" id="analyze">Generate proposal</button>
+        </div>
+      </div>
+      <div id="review-stage" style="display:none">
+        <h1>Review Commons Upload</h1>
+        <label for="review-hint">Hint</label>
+        <textarea id="review-hint" placeholder="Optional hint for re-analysis."></textarea>
+        <div class="actions">
+          <button type="button" class="secondary" id="redo">Redo with hint</button>
+        </div>
+        <label for="filename">Filename</label>
+        <input id="filename" type="text" value="">
+        <label for="caption">Caption</label>
+        <textarea id="caption"></textarea>
+        <label>Categories</label>
+        <div id="categories"></div>
+        <button type="button" class="secondary" id="add-category">Add category</button>
+        <div class="actions">
+          <button type="button" class="primary" id="submit">Save and upload</button>
+        </div>
+      </div>
       <div class="actions">
-        <button type="button" class="primary" id="submit">Save and upload</button>
         <div class="spinner" id="spinner"></div>
         <div class="status" id="status"></div>
       </div>
@@ -973,6 +997,10 @@ def _html_page(state: dict[str, Any]) -> str:
   </div>
   <script>
     const categories = document.getElementById("categories");
+    const spinner = document.getElementById("spinner");
+    const status = document.getElementById("status");
+    const hintStage = document.getElementById("hint-stage");
+    const reviewStage = document.getElementById("review-stage");
     function wireRemoveButtons(root) {{
       root.querySelectorAll(".remove-btn").forEach((button) => {{
         button.onclick = () => button.parentElement.remove();
@@ -988,11 +1016,49 @@ def _html_page(state: dict[str, Any]) -> str:
     }}
     wireRemoveButtons(document);
     document.getElementById("add-category").onclick = () => addCategory("");
-    document.getElementById("submit").onclick = async () => {{
-      const spinner = document.getElementById("spinner");
-      const status = document.getElementById("status");
+    function setBusy(message) {{
       spinner.classList.add("visible");
-      status.textContent = "Uploading...";
+      status.textContent = message;
+    }}
+    function clearBusy(message = "") {{
+      spinner.classList.remove("visible");
+      status.textContent = message;
+    }}
+    function populateReview(data) {{
+      document.getElementById("review-hint").value = data.hint || "";
+      document.getElementById("filename").value = data.filename;
+      document.getElementById("caption").value = data.caption;
+      categories.innerHTML = "";
+      data.categories.forEach((category) => addCategory(category));
+      hintStage.style.display = "none";
+      reviewStage.style.display = "block";
+    }}
+    async function analyzeWithHint(hintValue) {{
+      setBusy("Generating proposal...");
+      const response = await fetch("/analyze", {{
+        method: "POST",
+        headers: {{ "Content-Type": "application/json" }},
+        body: JSON.stringify({{ hint: hintValue }}),
+      }});
+      const data = await response.json();
+      if (!response.ok) {{
+        clearBusy(data.error || "Analysis failed");
+        return null;
+      }}
+      populateReview(data);
+      clearBusy("Proposal ready.");
+      return data;
+    }}
+    document.getElementById("analyze").onclick = async () => {{
+      const hintValue = document.getElementById("hint").value.trim();
+      await analyzeWithHint(hintValue);
+    }};
+    document.getElementById("redo").onclick = async () => {{
+      const hintValue = document.getElementById("review-hint").value.trim();
+      await analyzeWithHint(hintValue);
+    }};
+    document.getElementById("submit").onclick = async () => {{
+      setBusy("Uploading...");
       const payload = {{
         filename: document.getElementById("filename").value,
         caption: document.getElementById("caption").value,
@@ -1007,8 +1073,7 @@ def _html_page(state: dict[str, Any]) -> str:
       }});
       const data = await response.json();
       if (!response.ok) {{
-        spinner.classList.remove("visible");
-        status.textContent = data.error || "Upload failed";
+        clearBusy(data.error || "Upload failed");
         return;
       }}
       status.textContent = "Upload complete. Redirecting...";
@@ -1065,55 +1130,64 @@ def run_app(image_path: Path) -> None:
     vision = VisionClient(openai_config)
     commons_api = CommonsApi(commons_config)
 
-    proposal = vision.propose_metadata(
-        image_data_url=image_data_url,
-        metadata=metadata,
-        suffix_hint=commons_config.filename_suffix,
-    )
-    print("OpenAI proposal received.", flush=True)
-    category_queries = _dedupe_preserve_order(
-        proposal["search_queries"] + proposal["keywords"]
-    )
-    print(
-        "Category search queries: " + json.dumps(category_queries, ensure_ascii=True),
-        flush=True,
-    )
-    category_graph = _build_category_graph(
-        commons_api=commons_api,
-        queries=category_queries,
-        limit_per_query=commons_config.search_limit_per_query,
-        max_candidate_categories=commons_config.max_candidate_categories,
-        max_parent_depth=commons_config.max_parent_depth,
-    )
-    selected = vision.choose_categories(
-        image_data_url=image_data_url,
-        metadata=metadata,
-        proposed_caption=proposal["caption_en"],
-        proposed_summary=proposal["visual_summary"],
-        category_graph=category_graph,
-    )
-    print("OpenAI category selection received.", flush=True)
-    model_categories = [
-        title.removeprefix("Category:") for title in selected["selected_categories"]
-    ]
-    model_categories = _remove_ancestor_duplicates(model_categories, category_graph)
-    equipment_categories = _resolve_equipment_categories(commons_api, metadata)
-    all_categories = _dedupe_preserve_order(model_categories + equipment_categories)
-    print(
-        "Initial proposed categories: " + json.dumps(all_categories, ensure_ascii=True),
-        flush=True,
-    )
-
     state = {
         "metadata": metadata.to_model_dict(),
-        "filename": _preferred_filename(
-            proposal["filename_stem"],
-            commons_config.filename_suffix,
-            image_path.suffix,
-        ),
-        "caption": proposal["caption_en"],
-        "categories": all_categories,
     }
+
+    def generate_review_state(user_hint: str) -> dict[str, Any]:
+        print(f"Starting AI analysis pipeline. Hint: {user_hint!r}", flush=True)
+        proposal = vision.propose_metadata(
+            image_data_url=image_data_url,
+            metadata=metadata,
+            suffix_hint=commons_config.filename_suffix,
+            user_hint=user_hint,
+        )
+        print("OpenAI proposal received.", flush=True)
+        category_queries = _dedupe_preserve_order(
+            proposal["search_queries"] + proposal["keywords"]
+        )
+        print(
+            "Category search queries: "
+            + json.dumps(category_queries, ensure_ascii=True),
+            flush=True,
+        )
+        category_graph = _build_category_graph(
+            commons_api=commons_api,
+            queries=category_queries,
+            limit_per_query=commons_config.search_limit_per_query,
+            max_candidate_categories=commons_config.max_candidate_categories,
+            max_parent_depth=commons_config.max_parent_depth,
+        )
+        selected = vision.choose_categories(
+            image_data_url=image_data_url,
+            metadata=metadata,
+            proposed_caption=proposal["caption_en"],
+            proposed_summary=proposal["visual_summary"],
+            category_graph=category_graph,
+            user_hint=user_hint,
+        )
+        print("OpenAI category selection received.", flush=True)
+        model_categories = [
+            title.removeprefix("Category:") for title in selected["selected_categories"]
+        ]
+        model_categories = _remove_ancestor_duplicates(model_categories, category_graph)
+        equipment_categories = _resolve_equipment_categories(commons_api, metadata)
+        all_categories = _dedupe_preserve_order(model_categories + equipment_categories)
+        print(
+            "Initial proposed categories: "
+            + json.dumps(all_categories, ensure_ascii=True),
+            flush=True,
+        )
+        return {
+            "hint": user_hint,
+            "filename": _preferred_filename(
+                proposal["filename_stem"],
+                commons_config.filename_suffix,
+                image_path.suffix,
+            ),
+            "caption": proposal["caption_en"],
+            "categories": all_categories,
+        }
 
     app = Flask(__name__)
 
@@ -1124,6 +1198,16 @@ def run_app(image_path: Path) -> None:
     @app.get("/image")
     def image() -> tuple[bytes, int, dict[str, str]]:
         return downsized_bytes, 200, {"Content-Type": mime_type}
+
+    @app.post("/analyze")
+    def analyze() -> tuple[Any, int]:
+        payload = request.get_json(force=True)
+        hint = payload.get("hint", "").strip()
+        try:
+            review_state = generate_review_state(hint)
+        except Exception as exc:
+            return jsonify({"error": str(exc)}), 500
+        return jsonify(review_state), 200
 
     @app.post("/submit")
     def submit() -> tuple[Any, int]:
