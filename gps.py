@@ -2,27 +2,17 @@ from math import atan2, cos, radians, sin, sqrt
 from pathlib import Path
 from typing import Optional, Tuple
 
-import yaml
 import subprocess
 import re
 
-
-# Load banned areas from YAML file
-def load_banned_areas(yaml_path=None):
-    if yaml_path is None:
-        yaml_path = Path(__file__).parent / "banned_areas.yaml"
-    else:
-        yaml_path = Path(yaml_path)
-    with open(yaml_path, "r") as file:
-        data = yaml.safe_load(file)
-    return data["banned_areas"]
+from config import load_config
 
 
-banned_areas = load_banned_areas()
+banned_areas = load_config().banned_areas
 
 
 # Function to check if a coordinate is within a banned area
-def is_in_banned_area(lat, lon):
+def is_in_banned_area(lat: float, lon: float) -> bool:
     def haversine(lat1, lon1, lat2, lon2):
         earth_radius = 6371000
         dlat = radians(lat2 - lat1)
@@ -35,13 +25,13 @@ def is_in_banned_area(lat, lon):
         return earth_radius * c
 
     for area in banned_areas:
-        distance = haversine(lat, lon, area["latitude"], area["longitude"])
-        if distance <= area["radius"]:
+        distance = haversine(lat, lon, area.latitude, area.longitude)
+        if distance <= area.radius_meters:
             return True
     return False
 
 
-def lat_lon_from_metadata(image_path: str) -> Optional[Tuple[float, float]]:
+def lat_lon_from_metadata(image_path: Path | str) -> Optional[Tuple[float, float]]:
     """
     Extract latitude and longitude from image metadata using exiv2 CLI.
     Returns (lat, lon) in decimal degrees or None if not available.
@@ -88,7 +78,7 @@ def lat_lon_from_metadata(image_path: str) -> Optional[Tuple[float, float]]:
 
 
 # Function to remove GPS data if within banned area
-def remove_gps_if_banned(image_path: str) -> bool:
+def remove_gps_if_banned(image_path: Path | str) -> bool:
     """
     Remove GPS metadata tags if image taken within a banned area.
     Returns True if metadata was modified.

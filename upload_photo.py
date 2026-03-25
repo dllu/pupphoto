@@ -8,19 +8,10 @@ from pathlib import Path
 
 from PIL import Image, ImageOps
 
+from config import load_config
 from gps import remove_gps_if_banned
 
 Image.MAX_IMAGE_PIXELS = None  # suppress stupid decompression bomb warning
-
-
-def get_xdg_user_dir(name: str, fallback: Path) -> Path:
-    try:
-        output = subprocess.check_output(["xdg-user-dir", name], text=True).strip()
-        if output:
-            return Path(output)
-    except Exception:
-        pass
-    return fallback
 
 
 def copy_to_clipboard(text: str) -> bool:
@@ -29,7 +20,10 @@ def copy_to_clipboard(text: str) -> bool:
     elif os.environ.get("DISPLAY"):
         cmd = ["xclip", "-selection", "c"]
     else:
-        print("Error: Unable to detect display server. Clipboard not updated.", file=sys.stderr)
+        print(
+            "Error: Unable to detect display server. Clipboard not updated.",
+            file=sys.stderr,
+        )
         return False
 
     try:
@@ -41,9 +35,9 @@ def copy_to_clipboard(text: str) -> bool:
 
 
 def upload_photo(src_file, resize=None, clipboard=False, clipboard_format=None):
+    config = load_config().upload
     src_path = Path(src_file)
-    pictures_dir = get_xdg_user_dir("PICTURES", Path.home() / "Pictures")
-    thumb_path = pictures_dir / "thumbs"
+    thumb_path = config.thumb_dir
     thumb_path.mkdir(exist_ok=True, parents=True)
 
     filename = src_path.name
@@ -70,12 +64,16 @@ def upload_photo(src_file, resize=None, clipboard=False, clipboard_format=None):
     with open(upload_src, "rb") as f:
         sha1 = hashlib.sha1(f.read()).hexdigest()
     dst_filename = f"{filename_no_ext}_{sha1[:16]}{ext}"
-    dst = f"b2:dllu-pics/{dst_filename}"
+    dst = f"{config.rclone_destination}/{dst_filename}"
 
     # Upload file, skipping if it already exists remotely
-    dst_url = f"https://i.dllu.net/{dst_filename}"
+    dst_url = f"{config.public_base_url}/{dst_filename}"
     if clipboard or clipboard_format is not None:
-        clipboard_text = dst_url if clipboard_format is None else clipboard_format.format(url=dst_url)
+        clipboard_text = (
+            dst_url
+            if clipboard_format is None
+            else clipboard_format.format(url=dst_url)
+        )
         if not copy_to_clipboard(clipboard_text):
             raise SystemExit(1)
     subprocess.run(["rclone", "copyto", "--ignore-existing", upload_src, dst])
@@ -83,7 +81,9 @@ def upload_photo(src_file, resize=None, clipboard=False, clipboard_format=None):
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Upload a photo and output its public URL.")
+    parser = argparse.ArgumentParser(
+        description="Upload a photo and output its public URL."
+    )
     parser.add_argument("src_file")
     parser.add_argument("resize", nargs="?", type=int)
     parser.add_argument(
