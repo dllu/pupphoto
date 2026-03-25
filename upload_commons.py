@@ -192,7 +192,9 @@ def _parse_exiv2_int(value: str | None) -> int | None:
     return int(round(parsed))
 
 
-def _supplement_metadata_with_exiv2(image_path: Path, metadata: PhotoMetadata) -> PhotoMetadata:
+def _supplement_metadata_with_exiv2(
+    image_path: Path, metadata: PhotoMetadata
+) -> PhotoMetadata:
     if metadata.focal_length_mm is None:
         metadata.focal_length_mm = _parse_exiv2_float(
             _exiv2_tag_value(image_path, "Exif.Photo.FocalLength"),
@@ -217,7 +219,11 @@ def _supplement_metadata_with_exiv2(image_path: Path, metadata: PhotoMetadata) -
         metadata.make = _exiv2_tag_value(image_path, "Exif.Image.Make")
     if metadata.model is None:
         metadata.model = _exiv2_tag_value(image_path, "Exif.Image.Model")
-    if metadata.captured_on is None or metadata.captured_at is None or metadata.captured_year is None:
+    if (
+        metadata.captured_on is None
+        or metadata.captured_at is None
+        or metadata.captured_year is None
+    ):
         captured_raw = _exiv2_tag_value(image_path, "Exif.Photo.DateTimeOriginal")
         if captured_raw:
             try:
@@ -227,7 +233,10 @@ def _supplement_metadata_with_exiv2(image_path: Path, metadata: PhotoMetadata) -
                 metadata.captured_year = captured_dt.year
             except ValueError:
                 pass
-    if metadata.exposure_time_label is None and metadata.exposure_time_seconds is not None:
+    if (
+        metadata.exposure_time_label is None
+        and metadata.exposure_time_seconds is not None
+    ):
         metadata.exposure_time_label = _format_fraction(metadata.exposure_time_seconds)
     if metadata.f_number_label is None and metadata.f_number is not None:
         metadata.f_number_label = _format_f_number(metadata.f_number)
@@ -484,7 +493,10 @@ class VisionClient:
     def propose_metadata(
         self, image_data_url: str, metadata: PhotoMetadata, suffix_hint: str
     ) -> dict[str, Any]:
-        print("Requesting filename, caption, and category search hints from OpenAI...", flush=True)
+        print(
+            "Requesting filename, caption, and category search hints from OpenAI...",
+            flush=True,
+        )
         schema = {
             "type": "object",
             "properties": {
@@ -1063,8 +1075,7 @@ def run_app(image_path: Path) -> None:
         proposal["search_queries"] + proposal["keywords"]
     )
     print(
-        "Category search queries: "
-        + json.dumps(category_queries, ensure_ascii=True),
+        "Category search queries: " + json.dumps(category_queries, ensure_ascii=True),
         flush=True,
     )
     category_graph = _build_category_graph(
@@ -1089,8 +1100,7 @@ def run_app(image_path: Path) -> None:
     equipment_categories = _resolve_equipment_categories(commons_api, metadata)
     all_categories = _dedupe_preserve_order(model_categories + equipment_categories)
     print(
-        "Initial proposed categories: "
-        + json.dumps(all_categories, ensure_ascii=True),
+        "Initial proposed categories: " + json.dumps(all_categories, ensure_ascii=True),
         flush=True,
     )
 
