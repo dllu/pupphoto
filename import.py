@@ -1,14 +1,14 @@
-#!/usr/bin/env python
-
+from pathlib import Path
 from dataclasses import dataclass, field
 from typing import List
-from pathlib import Path
 import hashlib
 import shutil
 import subprocess
-from tqdm import tqdm
 import datetime
 import os
+from tqdm import tqdm
+
+from config import load_config
 
 
 # Compute SHA1 hash of a file
@@ -75,14 +75,16 @@ class Summary:
         return "\n".join(out)
 
 
-def copy_and_rename_files(source, photo_destination, video_destination):
+def copy_and_rename_files(
+    source: Path,
+    photo_destination: Path,
+    video_destination: Path,
+    supported_raw_formats: list[str],
+    supported_video_formats: list[str],
+):
     # Ensure destination directories exist
     photo_destination.mkdir(parents=True, exist_ok=True)
     video_destination.mkdir(parents=True, exist_ok=True)
-
-    # Define supported formats
-    supported_raw_formats = [".raf", ".dng", ".cr3", ".arw"]
-    supported_video_formats = [".mov", ".mp4", ".avi", ".mkv"]
 
     summary = Summary()
 
@@ -146,14 +148,19 @@ def copy_and_rename_files(source, photo_destination, video_destination):
 
 
 def main():
-    camera_dir = Path("/mnt/camera/DCIM")
-    photo_destination = Path("/home/dllu/pictures/raw")
-    video_destination = Path("/home/dllu/videos")
+    app_config = load_config()
+    config = app_config.import_config
 
     # Process each subdirectory in the camera directory
-    for source_dir in camera_dir.glob("*/"):
+    for source_dir in config.camera_dir.glob("*/"):
         if source_dir.is_dir():
-            copy_and_rename_files(source_dir, photo_destination, video_destination)
+            copy_and_rename_files(
+                source_dir,
+                config.photo_destination,
+                config.video_destination,
+                config.supported_raw_formats,
+                config.supported_video_formats,
+            )
 
 
 if __name__ == "__main__":

@@ -1,10 +1,12 @@
 #!/usr/bin/env python3
 
 import webbrowser
+from pathlib import Path
+
 from gps import lat_lon_from_metadata
 
 
-def open_location_in_maps(image_path: str):
+def open_location_in_maps(image_path: Path | str):
     lat_lon = lat_lon_from_metadata(image_path)
 
     if lat_lon:
