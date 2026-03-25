@@ -5,7 +5,10 @@ description = "Personal photo import and upload scripts."
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
+    "flask",
+    "openai",
     "pillow",
+    "requests",
     "tqdm",
 ]
 

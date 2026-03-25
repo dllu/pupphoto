@@ -18,6 +18,9 @@ uv run python upload_clipboard.py path/to/photo.jpg
 uv run python upload_blog.py path/to/photo.jpg
 uv run python albumize.py path/to/photo1.jpg path/to/photo2.jpg
 uv run python open_gps_google_maps.py path/to/photo.jpg
+uv run python upload_commons.py path/to/photo.jpg
 ```
 
 `import.py` imports from the configured camera directory, stores photos and videos in the configured destinations, and renames files to date, original filename, and the SHA1 of the raw file. For example, `DSCF2300.JPG` and `DSCF2300.RAF` become `2023-10-01-11-36-11_DSCF2300_53e266aac66a4b9cb37380214334d15b58517061.jpg` and `2023-10-01-11-36-11_DSCF2300_53e266aac66a4b9cb37380214334d15b58517061.raf`.
+
+`upload_commons.py` opens a local review UI on a randomized localhost port, proposes a filename, caption, and candidate Commons categories with the OpenAI Responses API plus Wikimedia Commons category search, and only uploads after you press the button. Configure OpenAI credentials, Commons credentials, author name, filename suffix, and license in `config.toml`.

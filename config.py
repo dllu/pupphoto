@@ -95,10 +95,60 @@ class AlbumConfig:
 
 
 @dataclass
+class OpenAIConfig:
+    api_key: str
+    vision_model: str
+    image_detail: str
+    downsized_max_dimension: int
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any], base_dir: Path) -> "OpenAIConfig":
+        kwargs = _section_kwargs(cls, data)
+        return cls(
+            api_key=kwargs["api_key"],
+            vision_model=kwargs["vision_model"],
+            image_detail=kwargs["image_detail"],
+            downsized_max_dimension=kwargs["downsized_max_dimension"],
+        )
+
+
+@dataclass
+class CommonsConfig:
+    api_url: str
+    username: str
+    password: str
+    author: str
+    license_wikitext: str
+    filename_suffix: str
+    search_limit_per_query: int
+    max_candidate_categories: int
+    max_parent_depth: int
+    ui_host: str
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any], base_dir: Path) -> "CommonsConfig":
+        kwargs = _section_kwargs(cls, data)
+        return cls(
+            api_url=kwargs["api_url"],
+            username=kwargs["username"],
+            password=kwargs["password"],
+            author=kwargs["author"],
+            license_wikitext=kwargs["license_wikitext"],
+            filename_suffix=kwargs["filename_suffix"],
+            search_limit_per_query=kwargs["search_limit_per_query"],
+            max_candidate_categories=kwargs["max_candidate_categories"],
+            max_parent_depth=kwargs["max_parent_depth"],
+            ui_host=kwargs["ui_host"],
+        )
+
+
+@dataclass
 class AppConfig:
     import_config: ImportConfig
     upload: UploadConfig
     album: AlbumConfig
+    openai: OpenAIConfig
+    commons: CommonsConfig
     banned_areas: list[BannedArea]
 
     @classmethod
@@ -107,6 +157,8 @@ class AppConfig:
             import_config=ImportConfig.from_dict(data["import"], base_dir),
             upload=UploadConfig.from_dict(data["upload"], base_dir),
             album=AlbumConfig.from_dict(data["album"], base_dir),
+            openai=OpenAIConfig.from_dict(data["openai"], base_dir),
+            commons=CommonsConfig.from_dict(data["commons"], base_dir),
             banned_areas=[BannedArea.from_dict(item) for item in data["banned_areas"]],
         )
 
@@ -130,6 +182,8 @@ class AppConfig:
                 "template_path": str(self.album.template_path),
                 "output_dir": str(self.album.output_dir),
             },
+            "openai": raw["openai"],
+            "commons": raw["commons"],
             "banned_areas": raw["banned_areas"],
         }
 
