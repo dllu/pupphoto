@@ -77,6 +77,8 @@ class CategoryNode:
     parents: list[str]
     query_hits: list[str]
     source: str
+    file_count: int
+    subcategory_count: int
 
 
 def _get_exif_value(exif: dict[int, Any], tag_name: str) -> Any:
@@ -127,6 +129,8 @@ def _format_fraction(seconds: float) -> str:
 def _format_f_number(value: float | None) -> str | None:
     if value is None:
         return None
+    if value <= 0:
+        return None
     if abs(value - round(value)) < 0.05:
         return f"f/{int(round(value))}"
     rounded = round(value, 1)
@@ -176,7 +180,9 @@ def _parse_exiv2_float(value: str | None, suffix: str = "") -> float | None:
     cleaned = value.removeprefix("F").strip()
     if suffix and cleaned.endswith(suffix):
         cleaned = cleaned[: -len(suffix)].strip()
-    rational_match = re.search(r"([-+]?\d+(?:\.\d+)?)\s*/\s*([-+]?\d+(?:\.\d+)?)", cleaned)
+    rational_match = re.search(
+        r"([-+]?\d+(?:\.\d+)?)\s*/\s*([-+]?\d+(?:\.\d+)?)", cleaned
+    )
     if rational_match:
         numerator = float(rational_match.group(1))
         denominator = float(rational_match.group(2))
@@ -359,6 +365,10 @@ def _json_schema(name: str, schema: dict[str, Any]) -> dict[str, Any]:
 
 
 class CommonsApi:
+    _TITLE_BATCH_SIZE = 50
+    _MAX_RETRIES = 4
+    _RETRYABLE_STATUS_CODES = {429, 500, 502, 503, 504}
+
     def __init__(self, config: CommonsConfig):
         self.config = config
         self.session = requests.Session()
@@ -368,44 +378,82 @@ class CommonsApi:
             }
         )
 
+    def _retry_delay_seconds(
+        self, response: requests.Response | None, attempt: int
+    ) -> float:
+        if response is not None:
+            retry_after = response.headers.get("Retry-After")
+            if retry_after:
+                try:
+                    return max(float(retry_after), 0.5)
+                except ValueError:
+                    pass
+        return min(1.5 * (2**attempt), 20.0)
+
+    def _request_json(
+        self,
+        method: str,
+        *,
+        timeout: int,
+        params: dict[str, Any] | None = None,
+        data: dict[str, Any] | None = None,
+        files: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        payload_params = {**(params or {}), "format": "json", "formatversion": "2"}
+        for attempt in range(self._MAX_RETRIES + 1):
+            response = self.session.request(
+                method,
+                self.config.api_url,
+                params=payload_params,
+                data=data,
+                files=files,
+                timeout=timeout,
+            )
+            if response.status_code in self._RETRYABLE_STATUS_CODES:
+                if attempt < self._MAX_RETRIES:
+                    delay = self._retry_delay_seconds(response, attempt)
+                    print(
+                        f"Commons API returned HTTP {response.status_code}; retrying in {delay:.1f}s...",
+                        flush=True,
+                    )
+                    time.sleep(delay)
+                    continue
+            response.raise_for_status()
+            data_json = response.json()
+            if "error" in data_json:
+                error = data_json["error"]
+                if error.get("code") in {"maxlag", "ratelimited"}:
+                    if attempt < self._MAX_RETRIES:
+                        delay = self._retry_delay_seconds(response, attempt)
+                        print(
+                            f"Commons API returned {error.get('code')}; retrying in {delay:.1f}s...",
+                            flush=True,
+                        )
+                        time.sleep(delay)
+                        continue
+                raise RuntimeError(error)
+            return data_json
+        raise RuntimeError("Commons API request failed after retries")
+
     def get(self, **params: Any) -> dict[str, Any]:
-        response = self.session.get(
-            self.config.api_url,
-            params={**params, "format": "json", "formatversion": "2"},
-            timeout=30,
-        )
-        response.raise_for_status()
-        data = response.json()
-        if "error" in data:
-            raise RuntimeError(data["error"])
-        return data
+        return self._request_json("GET", params=params, timeout=30)
 
     def post(self, **params: Any) -> dict[str, Any]:
-        response = self.session.post(
-            self.config.api_url,
+        return self._request_json(
+            "POST",
             data={**params, "format": "json", "formatversion": "2"},
             timeout=60,
         )
-        response.raise_for_status()
-        data = response.json()
-        if "error" in data:
-            raise RuntimeError(data["error"])
-        return data
 
     def post_upload(
         self, params: dict[str, Any], files: dict[str, Any]
     ) -> dict[str, Any]:
-        response = self.session.post(
-            self.config.api_url,
+        return self._request_json(
+            "POST",
             data={**params, "format": "json", "formatversion": "2"},
             files=files,
             timeout=300,
         )
-        response.raise_for_status()
-        data = response.json()
-        if "error" in data:
-            raise RuntimeError(data["error"])
-        return data
 
     def login(self) -> None:
         print("Logging in to Wikimedia Commons...", flush=True)
@@ -436,25 +484,61 @@ class CommonsApi:
         )
         return [item["title"] for item in data.get("query", {}).get("search", [])]
 
+    def search_files_by_raw_sha1(self, raw_sha1sum: str, limit: int = 10) -> list[str]:
+        print(
+            f"Searching Commons files for raw SHA1 sum: {raw_sha1sum}", flush=True
+        )
+        data = self.get(
+            action="query",
+            list="search",
+            srsearch=f"\"{raw_sha1sum}\"",
+            srnamespace="6",
+            srwhat="text",
+            srlimit=limit,
+        )
+        return [item["title"] for item in data.get("query", {}).get("search", [])]
+
     def category_exists(self, title: str) -> bool:
         pages = self.get(action="query", titles=title)["query"]["pages"]
         return bool(pages) and "missing" not in pages[0]
 
-    def category_parents(self, titles: list[str]) -> dict[str, list[str]]:
-        result: dict[str, list[str]] = {}
-        for batch_start in range(0, len(titles), 20):
-            batch = titles[batch_start : batch_start + 20]
+    def category_details(self, titles: list[str]) -> dict[str, dict[str, Any]]:
+        result: dict[str, dict[str, Any]] = {}
+        for batch_start in range(0, len(titles), self._TITLE_BATCH_SIZE):
+            batch = titles[batch_start : batch_start + self._TITLE_BATCH_SIZE]
             pages = self.get(
                 action="query",
                 titles="|".join(batch),
-                prop="categories",
+                prop="categories|categoryinfo",
                 cllimit="max",
                 clshow="!hidden",
             )["query"]["pages"]
             for page in pages:
-                result[page["title"]] = [
-                    category["title"] for category in page.get("categories", [])
-                ]
+                info = page.get("categoryinfo", {})
+                result[page["title"]] = {
+                    "parents": [
+                        category["title"] for category in page.get("categories", [])
+                    ],
+                    "file_count": int(info.get("files", 0)),
+                    "subcategory_count": int(info.get("subcats", 0)),
+                }
+        return result
+
+    def category_counts(self, titles: list[str]) -> dict[str, dict[str, int]]:
+        result: dict[str, dict[str, int]] = {}
+        for batch_start in range(0, len(titles), self._TITLE_BATCH_SIZE):
+            batch = titles[batch_start : batch_start + self._TITLE_BATCH_SIZE]
+            pages = self.get(
+                action="query",
+                titles="|".join(batch),
+                prop="categoryinfo",
+            )["query"]["pages"]
+            for page in pages:
+                info = page.get("categoryinfo", {})
+                result[page["title"]] = {
+                    "file_count": int(info.get("files", 0)),
+                    "subcategory_count": int(info.get("subcats", 0)),
+                }
         return result
 
     def upload_file(
@@ -489,6 +573,38 @@ class CommonsApi:
         if upload["result"] != "Success":
             raise RuntimeError(f"Commons upload failed: {upload}")
         return f"https://commons.wikimedia.org/wiki/File:{filename.replace(' ', '_')}"
+
+    def overwrite_file(
+        self,
+        image_path: Path,
+        title: str,
+        summary: str,
+    ) -> str:
+        self.login()
+        token = self.csrf_token()
+        filename = title.removeprefix("File:")
+        print(f"Overwriting Commons file {title}...", flush=True)
+        with image_path.open("rb") as f:
+            data = self.post_upload(
+                params={
+                    "action": "upload",
+                    "filename": filename,
+                    "comment": summary,
+                    "ignorewarnings": "1",
+                    "token": token,
+                },
+                files={
+                    "file": (
+                        filename,
+                        f,
+                        mimetypes.guess_type(filename)[0] or "application/octet-stream",
+                    )
+                },
+            )
+        upload = data["upload"]
+        if upload["result"] != "Success":
+            raise RuntimeError(f"Commons overwrite failed: {upload}")
+        return _commons_file_url(title)
 
 
 class VisionClient:
@@ -531,8 +647,14 @@ class VisionClient:
             "Write a concise English filename stem using plain ASCII words separated by spaces, "
             "without file extension and without the configured suffix. "
             "Write a concise, factual, neutral, encyclopedic English caption. "
+            "Treat the optional user hint as high-priority factual context when it provides names, locations, dates, events, or the shooting viewpoint. "
+            "Silently correct likely misspellings in the user hint when generating the caption, keywords, and category search queries. "
             "Generate search queries for Wikimedia Commons categories that emphasize specific depicted subjects, "
             "locations, events, operators, object classes, and year if relevant. "
+            "When the image is described as a subject seen from a named place or viewpoint, include highly specific queries for that relationship, such as "
+            '"<subject> from <viewpoint>", "views of <subject> from <viewpoint>", and other exact proper-name combinations that could match an existing Commons category. '
+            "Prefer exact proper names over generic descriptions in search queries. "
+            "When the time of day or lighting is visually clear and categorically useful, include search queries for that too, such as dusk, sunset, dawn, night, or blue hour, combined with the location if appropriate. "
             "Do not include photographic equipment categories in the search queries; those are handled separately. "
             "Avoid speculation and avoid promotional language. "
             f"The upload workflow will append this suffix later if non-empty: {suffix_hint!r}."
@@ -596,10 +718,16 @@ class VisionClient:
             "Return JSON only. "
             "Choose only from the supplied candidate graph. "
             "Prefer the most specific applicable categories. "
+            "Treat the optional user hint as high-priority factual context when it identifies the subject, place, event, or named viewpoint, even if the image alone would be ambiguous. "
+            "If the hint implies a viewpoint or depiction relationship such as a landmark seen from a named overlook, prefer a candidate category that captures that exact relationship. "
+            "Each candidate includes file_count and subcategory_count from Commons. "
+            "In general, do not select categories with file_count = 0 for a photo upload, even if they have subcategories. "
+            "Prefer categories that already contain files when an otherwise-similar empty category is available. "
             "Do not select both a category and its ancestor when the child already fully covers the image. "
             "Avoid maintenance, creator, user, and campaign categories. "
             "Do not add photographic equipment or exposure parameter categories; those are handled separately. "
             "Choose categories that are directly supported by the image and metadata. "
+            "If the image clearly shows a meaningful time-of-day or lighting condition such as dusk, sunset, dawn, or night, include an appropriate category for that when it exists in the candidate graph. "
             "If a place, operator, event, station, vehicle type, or year category is clearly applicable, prefer the specific leaf category over a broad regional or parent category."
         )
         response = self.client.responses.create(
@@ -702,7 +830,14 @@ def _build_category_graph(
         for title in commons_api.search_categories(query, limit_per_query):
             node = seed_nodes.setdefault(
                 title,
-                CategoryNode(title=title, parents=[], query_hits=[], source="search"),
+                CategoryNode(
+                    title=title,
+                    parents=[],
+                    query_hits=[],
+                    source="search",
+                    file_count=0,
+                    subcategory_count=0,
+                ),
             )
             node.query_hits.append(query)
     limited_titles = list(seed_nodes)[:max_candidate_categories]
@@ -710,13 +845,20 @@ def _build_category_graph(
         title: seed_nodes[title] for title in limited_titles
     }
     frontier = list(graph_nodes)
+    detailed_titles: set[str] = set()
     depth = 0
     while frontier and depth < max_parent_depth:
-        parents_map = commons_api.category_parents(frontier)
+        details_map = commons_api.category_details(frontier)
         next_frontier: list[str] = []
         for title in frontier:
-            parents = parents_map.get(title, [])
+            details = details_map.get(title, {})
+            parents = details.get("parents", [])
             graph_nodes[title].parents = parents
+            graph_nodes[title].file_count = int(details.get("file_count", 0))
+            graph_nodes[title].subcategory_count = int(
+                details.get("subcategory_count", 0)
+            )
+            detailed_titles.add(title)
             for parent in parents:
                 if parent not in graph_nodes:
                     graph_nodes[parent] = CategoryNode(
@@ -724,16 +866,27 @@ def _build_category_graph(
                         parents=[],
                         query_hits=[],
                         source="ancestor",
+                        file_count=0,
+                        subcategory_count=0,
                     )
                     next_frontier.append(parent)
         frontier = next_frontier
         depth += 1
+    remaining_titles = [title for title in graph_nodes if title not in detailed_titles]
+    counts_map = commons_api.category_counts(remaining_titles)
+    for title, node in graph_nodes.items():
+        counts = counts_map.get(title, {})
+        if counts:
+            node.file_count = int(counts.get("file_count", 0))
+            node.subcategory_count = int(counts.get("subcategory_count", 0))
     return {
         "nodes": {
             title: {
                 "parents": node.parents,
                 "query_hits": _dedupe_preserve_order(node.query_hits),
                 "source": node.source,
+                "file_count": node.file_count,
+                "subcategory_count": node.subcategory_count,
             }
             for title, node in sorted(graph_nodes.items())
         }
@@ -762,6 +915,27 @@ def _remove_ancestor_duplicates(
         if selected_set.intersection(ancestors_of(category)):
             continue
         filtered.append(category)
+    return filtered
+
+
+def _remove_empty_categories(
+    selected_categories: list[str], graph: dict[str, Any]
+) -> list[str]:
+    node_map = graph.get("nodes", {})
+    filtered: list[str] = []
+    removed: list[str] = []
+    for category in selected_categories:
+        node = node_map.get(f"Category:{category}", {})
+        if int(node.get("file_count", 0)) <= 0:
+            removed.append(category)
+            continue
+        filtered.append(category)
+    if removed:
+        print(
+            "Dropping zero-file topical categories: "
+            + json.dumps(removed, ensure_ascii=True),
+            flush=True,
+        )
     return filtered
 
 
@@ -822,6 +996,25 @@ def _free_port(host: str) -> int:
 
 
 def _html_page(state: dict[str, Any]) -> str:
+    warning_banner = ""
+    if state.get("sha1_matches"):
+        sha1_line = ""
+        if state.get("raw_sha1sum"):
+            sha1_line = f'<p><code>{escape(state["raw_sha1sum"])}</code></p>'
+        match_items = "".join(
+            f'<li><a href="{escape(item["url"])}" target="_blank" rel="noreferrer">{escape(item["title"])}</a>'
+            f'<button type="button" class="overwrite-btn" data-file-title="{escape(item["title"], quote=True)}">Overwrite this file</button></li>'
+            for item in state.get("sha1_matches", [])
+        )
+        warning_banner = (
+            '<div class="warning-banner">'
+            "<h2>Possible Existing Uploads</h2>"
+            "<p>This photo's raw SHA1 sum was found on Commons. These may be existing uploads of the same source file or variants derived from it. You can still continue if this upload is intentionally different, or overwrite one of these files if this is a minor improved version.</p>"
+            + sha1_line
+            + "<ul>"
+            + match_items
+            + "</ul></div>"
+        )
     return f"""<!doctype html>
 <html lang="en">
 <head>
@@ -840,9 +1033,7 @@ def _html_page(state: dict[str, Any]) -> str:
     body {{
       margin: 0;
       font-family: Georgia, "Iowan Old Style", serif;
-      background:
-        radial-gradient(circle at top left, rgba(142,59,27,.10), transparent 28rem),
-        linear-gradient(180deg, #efe7d6 0%, var(--bg) 100%);
+      background: var(--bg);
       color: var(--ink);
     }}
     .page {{
@@ -874,6 +1065,51 @@ def _html_page(state: dict[str, Any]) -> str:
     }}
     .form-card {{
       padding: 20px;
+    }}
+    .warning-banner {{
+      margin: 0 0 18px;
+      padding: 14px 16px;
+      border: 1px solid #d5b16d;
+      border-radius: 14px;
+      background: #fff1cf;
+      color: #5d3d0c;
+    }}
+    .warning-banner h2 {{
+      margin: 0 0 8px;
+      font-size: 18px;
+      line-height: 1.2;
+    }}
+    .warning-banner p {{
+      margin: 0 0 10px;
+      font-size: 14px;
+      line-height: 1.45;
+    }}
+    .warning-banner ul {{
+      margin: 0;
+      padding-left: 18px;
+    }}
+    .warning-banner li {{
+      display: flex;
+      gap: 10px;
+      align-items: center;
+      justify-content: space-between;
+      flex-wrap: wrap;
+    }}
+    .warning-banner li + li {{
+      margin-top: 6px;
+    }}
+    .warning-banner a {{
+      color: inherit;
+    }}
+    .warning-banner code {{
+      font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+      font-size: 13px;
+    }}
+    .warning-banner .overwrite-btn {{
+      padding: 8px 12px;
+      background: #eadfcd;
+      color: #3d2d20;
+      white-space: nowrap;
     }}
     h1 {{
       margin: 0 0 16px;
@@ -944,6 +1180,16 @@ def _html_page(state: dict[str, Any]) -> str:
       min-height: 1.2em;
       font-size: 14px;
       color: #5f4635;
+      overflow-wrap: anywhere;
+    }}
+    .status.error {{
+      width: 100%;
+      padding: 10px 12px;
+      border: 1px solid var(--line);
+      border-radius: 10px;
+      background: #f8efe4;
+      white-space: pre-wrap;
+      font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
     }}
     @keyframes spin {{
       to {{ transform: rotate(360deg); }}
@@ -964,6 +1210,7 @@ def _html_page(state: dict[str, Any]) -> str:
     <section class="card form-card">
       <div id="hint-stage">
         <h1>Prepare Commons Upload</h1>
+        {warning_banner}
         <p>Add an optional hint if the model may struggle to identify the subject, location, event, or other context from the image alone.</p>
         <label for="hint">Hint</label>
         <textarea id="hint" placeholder="Optional: identify the subject, place, event, or any other context for the AI."></textarea>
@@ -1016,12 +1263,32 @@ def _html_page(state: dict[str, Any]) -> str:
     }}
     wireRemoveButtons(document);
     document.getElementById("add-category").onclick = () => addCategory("");
+    document.querySelectorAll(".overwrite-btn").forEach((button) => {{
+      button.onclick = async () => {{
+        const title = button.dataset.fileTitle;
+        setBusy(`Overwriting ${{title}}...`);
+        const response = await fetch("/overwrite", {{
+          method: "POST",
+          headers: {{ "Content-Type": "application/json" }},
+          body: JSON.stringify({{ title }}),
+        }});
+        const data = await response.json();
+        if (!response.ok) {{
+          clearBusy(data.error || "Overwrite failed", true);
+          return;
+        }}
+        clearBusy("Overwrite complete. Redirecting...");
+        window.location.href = data.redirect_url;
+      }};
+    }});
     function setBusy(message) {{
       spinner.classList.add("visible");
+      status.classList.remove("error");
       status.textContent = message;
     }}
-    function clearBusy(message = "") {{
+    function clearBusy(message = "", isError = false) {{
       spinner.classList.remove("visible");
+      status.classList.toggle("error", isError);
       status.textContent = message;
     }}
     function populateReview(data) {{
@@ -1042,7 +1309,7 @@ def _html_page(state: dict[str, Any]) -> str:
       }});
       const data = await response.json();
       if (!response.ok) {{
-        clearBusy(data.error || "Analysis failed");
+        clearBusy(data.error || "Analysis failed", true);
         return null;
       }}
       populateReview(data);
@@ -1073,10 +1340,10 @@ def _html_page(state: dict[str, Any]) -> str:
       }});
       const data = await response.json();
       if (!response.ok) {{
-        clearBusy(data.error || "Upload failed");
+        clearBusy(data.error || "Upload failed", true);
         return;
       }}
-      status.textContent = "Upload complete. Redirecting...";
+      clearBusy("Upload complete. Redirecting...");
       window.location.href = data.redirect_url;
     }};
   </script>
@@ -1106,6 +1373,10 @@ def _validate_required_config(
         )
 
 
+def _commons_file_url(title: str) -> str:
+    return "https://commons.wikimedia.org/wiki/" + title.replace(" ", "_")
+
+
 def run_app(image_path: Path) -> None:
     app_config = load_config()
     commons_config = app_config.commons
@@ -1129,9 +1400,23 @@ def run_app(image_path: Path) -> None:
 
     vision = VisionClient(openai_config)
     commons_api = CommonsApi(commons_config)
+    sha1_matches: list[dict[str, str]] = []
+    if metadata.raw_sha1sum:
+        sha1_matches = [
+            {"title": title, "url": _commons_file_url(title)}
+            for title in commons_api.search_files_by_raw_sha1(metadata.raw_sha1sum)
+        ]
+        if sha1_matches:
+            print(
+                "Found Commons files with matching raw SHA1 sum: "
+                + json.dumps([item["title"] for item in sha1_matches], ensure_ascii=True),
+                flush=True,
+            )
 
     state = {
         "metadata": metadata.to_model_dict(),
+        "raw_sha1sum": metadata.raw_sha1sum,
+        "sha1_matches": sha1_matches,
     }
 
     def generate_review_state(user_hint: str) -> dict[str, Any]:
@@ -1170,6 +1455,7 @@ def run_app(image_path: Path) -> None:
         model_categories = [
             title.removeprefix("Category:") for title in selected["selected_categories"]
         ]
+        model_categories = _remove_empty_categories(model_categories, category_graph)
         model_categories = _remove_ancestor_duplicates(model_categories, category_graph)
         equipment_categories = _resolve_equipment_categories(commons_api, metadata)
         all_categories = _dedupe_preserve_order(model_categories + equipment_categories)
@@ -1232,6 +1518,26 @@ def run_app(image_path: Path) -> None:
                 filename=filename,
                 description_wikitext=description,
                 summary=f"Uploading {filename} via pupphoto",
+            )
+        except Exception as exc:
+            return jsonify({"error": str(exc)}), 500
+        _schedule_exit()
+        return jsonify({"redirect_url": redirect_url}), 200
+
+    @app.post("/overwrite")
+    def overwrite() -> tuple[Any, int]:
+        payload = request.get_json(force=True)
+        title = payload.get("title", "").strip()
+        if not title.startswith("File:"):
+            return jsonify({"error": "Invalid file title"}), 400
+        valid_titles = {item["title"] for item in sha1_matches}
+        if title not in valid_titles:
+            return jsonify({"error": "File is not in the matching SHA1 list"}), 400
+        try:
+            redirect_url = commons_api.overwrite_file(
+                image_path=image_path,
+                title=title,
+                summary=f"Uploading new version of {title} via pupphoto",
             )
         except Exception as exc:
             return jsonify({"error": str(exc)}), 500

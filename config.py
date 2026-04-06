@@ -124,6 +124,8 @@ class CommonsConfig:
     max_candidate_categories: int
     max_parent_depth: int
     ui_host: str
+    quality_images_category: str
+    quality_images_scan_limit: int
 
     @classmethod
     def from_dict(cls, data: dict[str, Any], base_dir: Path) -> "CommonsConfig":
@@ -139,6 +141,8 @@ class CommonsConfig:
             max_candidate_categories=kwargs["max_candidate_categories"],
             max_parent_depth=kwargs["max_parent_depth"],
             ui_host=kwargs["ui_host"],
+            quality_images_category=kwargs["quality_images_category"],
+            quality_images_scan_limit=kwargs["quality_images_scan_limit"],
         )
 
 
