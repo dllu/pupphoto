@@ -15,3 +15,17 @@ dependencies = [
 [build-system]
 requires = ["setuptools>=68"]
 build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+py-modules = [
+    "albumize",
+    "config",
+    "gps",
+    "import",
+    "open_gps_google_maps",
+    "tag_quality_images",
+    "upload_blog",
+    "upload_clipboard",
+    "upload_commons",
+    "upload_photo",
+]
