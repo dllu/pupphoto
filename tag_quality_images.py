@@ -190,7 +190,9 @@ class CommonsApi:
                 revisions = page.get("revisions", [])
                 content = ""
                 if revisions:
-                    content = revisions[0].get("slots", {}).get("main", {}).get("content", "")
+                    content = (
+                        revisions[0].get("slots", {}).get("main", {}).get("content", "")
+                    )
                 result[page["title"]] = content
         return result
 

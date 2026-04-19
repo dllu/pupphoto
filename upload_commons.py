@@ -39,6 +39,7 @@ RAW_SHA1_RE = re.compile(
     r"^\d{4}-\d{2}-\d{2}-\d{2}-\d{2}-\d{2}_.+_([0-9a-f]{40})\.[^.]+$",
     re.IGNORECASE,
 )
+MAX_CATEGORY_SEARCH_QUERIES = 12
 
 
 @dataclass
@@ -75,6 +76,7 @@ class PhotoMetadata:
 class CategoryNode:
     title: str
     parents: list[str]
+    children: list[str]
     query_hits: list[str]
     source: str
     file_count: int
@@ -367,10 +369,13 @@ def _json_schema(name: str, schema: dict[str, Any]) -> dict[str, Any]:
 class CommonsApi:
     _TITLE_BATCH_SIZE = 50
     _MAX_RETRIES = 4
+    _MAX_RETRY_DELAY_SECONDS = 30.0
+    _MAX_CHILD_CATEGORY_LOOKUPS = 12
     _RETRYABLE_STATUS_CODES = {429, 500, 502, 503, 504}
 
     def __init__(self, config: CommonsConfig):
         self.config = config
+        self._logged_in = False
         self.session = requests.Session()
         self.session.headers.update(
             {
@@ -385,10 +390,31 @@ class CommonsApi:
             retry_after = response.headers.get("Retry-After")
             if retry_after:
                 try:
-                    return max(float(retry_after), 0.5)
+                    return min(
+                        max(float(retry_after), 0.5),
+                        self._MAX_RETRY_DELAY_SECONDS,
+                    )
                 except ValueError:
                     pass
-        return min(1.5 * (2**attempt), 20.0)
+        return min(1.5 * (2**attempt), self._MAX_RETRY_DELAY_SECONDS)
+
+    def _retry_message(
+        self, response: requests.Response | None, delay: float, reason: str
+    ) -> str:
+        retry_after = (
+            response.headers.get("Retry-After") if response is not None else None
+        )
+        if retry_after:
+            try:
+                requested_delay = float(retry_after)
+            except ValueError:
+                requested_delay = None
+            if requested_delay is not None and requested_delay > delay:
+                return (
+                    f"Commons API returned {reason}; server requested "
+                    f"{requested_delay:.1f}s, retrying in capped {delay:.1f}s..."
+                )
+        return f"Commons API returned {reason}; retrying in {delay:.1f}s..."
 
     def _request_json(
         self,
@@ -413,7 +439,9 @@ class CommonsApi:
                 if attempt < self._MAX_RETRIES:
                     delay = self._retry_delay_seconds(response, attempt)
                     print(
-                        f"Commons API returned HTTP {response.status_code}; retrying in {delay:.1f}s...",
+                        self._retry_message(
+                            response, delay, f"HTTP {response.status_code}"
+                        ),
                         flush=True,
                     )
                     time.sleep(delay)
@@ -426,7 +454,7 @@ class CommonsApi:
                     if attempt < self._MAX_RETRIES:
                         delay = self._retry_delay_seconds(response, attempt)
                         print(
-                            f"Commons API returned {error.get('code')}; retrying in {delay:.1f}s...",
+                            self._retry_message(response, delay, error.get("code")),
                             flush=True,
                         )
                         time.sleep(delay)
@@ -456,6 +484,8 @@ class CommonsApi:
         )
 
     def login(self) -> None:
+        if self._logged_in:
+            return
         print("Logging in to Wikimedia Commons...", flush=True)
         login_token = self.get(action="query", meta="tokens", type="login")["query"][
             "tokens"
@@ -468,6 +498,7 @@ class CommonsApi:
         )
         if result["login"]["result"] != "Success":
             raise RuntimeError(f"Commons login failed: {result['login']}")
+        self._logged_in = True
 
     def csrf_token(self) -> str:
         return self.get(action="query", meta="tokens")["query"]["tokens"]["csrftoken"]
@@ -484,14 +515,28 @@ class CommonsApi:
         )
         return [item["title"] for item in data.get("query", {}).get("search", [])]
 
+    def existing_category_titles(self, titles: list[str]) -> list[str]:
+        if not titles:
+            return []
+        result: list[str] = []
+        for batch_start in range(0, len(titles), self._TITLE_BATCH_SIZE):
+            batch = titles[batch_start : batch_start + self._TITLE_BATCH_SIZE]
+            pages = self.get(
+                action="query",
+                titles="|".join(batch),
+                prop="categoryinfo",
+            )["query"]["pages"]
+            for page in pages:
+                if "missing" not in page and page.get("ns") == 14:
+                    result.append(page["title"])
+        return result
+
     def search_files_by_raw_sha1(self, raw_sha1sum: str, limit: int = 10) -> list[str]:
-        print(
-            f"Searching Commons files for raw SHA1 sum: {raw_sha1sum}", flush=True
-        )
+        print(f"Searching Commons files for raw SHA1 sum: {raw_sha1sum}", flush=True)
         data = self.get(
             action="query",
             list="search",
-            srsearch=f"\"{raw_sha1sum}\"",
+            srsearch=f'"{raw_sha1sum}"',
             srnamespace="6",
             srwhat="text",
             srlimit=limit,
@@ -522,6 +567,25 @@ class CommonsApi:
                     "file_count": int(info.get("files", 0)),
                     "subcategory_count": int(info.get("subcats", 0)),
                 }
+        return result
+
+    def category_subcategories(
+        self, titles: list[str], limit_per_category: int
+    ) -> dict[str, list[str]]:
+        result: dict[str, list[str]] = {}
+        for title in titles:
+            data = self.get(
+                action="query",
+                list="categorymembers",
+                cmtitle=title,
+                cmnamespace="14",
+                cmtype="subcat",
+                cmlimit=limit_per_category,
+            )
+            result[title] = [
+                item["title"]
+                for item in data.get("query", {}).get("categorymembers", [])
+            ]
         return result
 
     def category_counts(self, titles: list[str]) -> dict[str, dict[str, int]]:
@@ -651,6 +715,7 @@ class VisionClient:
             "Silently correct likely misspellings in the user hint when generating the caption, keywords, and category search queries. "
             "Generate search queries for Wikimedia Commons categories that emphasize specific depicted subjects, "
             "locations, events, operators, object classes, and year if relevant. "
+            "Generate no more than 8 category search queries, and make each one specific enough to plausibly match a Commons category title. "
             "When the image is described as a subject seen from a named place or viewpoint, include highly specific queries for that relationship, such as "
             '"<subject> from <viewpoint>", "views of <subject> from <viewpoint>", and other exact proper-name combinations that could match an existing Commons category. '
             "Prefer exact proper names over generic descriptions in search queries. "
@@ -717,18 +782,19 @@ class VisionClient:
             "You are selecting Wikimedia Commons topical categories for a single image. "
             "Return JSON only. "
             "Choose only from the supplied candidate graph. "
-            "Prefer the most specific applicable categories. "
+            "Prefer the most specific applicable categories, especially categories whose title exactly combines the depicted object or scene type with the named place. "
             "Treat the optional user hint as high-priority factual context when it identifies the subject, place, event, or named viewpoint, even if the image alone would be ambiguous. "
             "If the hint implies a viewpoint or depiction relationship such as a landmark seen from a named overlook, prefer a candidate category that captures that exact relationship. "
-            "Each candidate includes file_count and subcategory_count from Commons. "
+            "Each candidate includes file_count and subcategory_count from Commons, plus parent and child category edges. "
             "In general, do not select categories with file_count = 0 for a photo upload, even if they have subcategories. "
             "Prefer categories that already contain files when an otherwise-similar empty category is available. "
-            "Do not select both a category and its ancestor when the child already fully covers the image. "
+            "Do not select both a category and its ancestor when the child already fully covers the image; choose the child. "
             "Avoid maintenance, creator, user, and campaign categories. "
             "Do not add photographic equipment or exposure parameter categories; those are handled separately. "
             "Choose categories that are directly supported by the image and metadata. "
             "If the image clearly shows a meaningful time-of-day or lighting condition such as dusk, sunset, dawn, or night, include an appropriate category for that when it exists in the candidate graph. "
-            "If a place, operator, event, station, vehicle type, or year category is clearly applicable, prefer the specific leaf category over a broad regional or parent category."
+            "If a place, operator, event, station, vehicle type, or year category is clearly applicable, prefer the specific leaf category over a broad regional or parent category. "
+            "For station photos, a category such as Platforms, interiors, roofs, concourses, or specific train services at the named station is usually better than a broad city, operator, or generic station category when it accurately describes the image."
         )
         response = self.client.responses.create(
             model=self.config.vision_model,
@@ -817,6 +883,42 @@ def _dedupe_preserve_order(values: list[str]) -> list[str]:
     return result
 
 
+def _category_title_variants(query: str) -> list[str]:
+    base = re.sub(r"\s+", " ", query.removeprefix("Category:").strip())
+    if not base:
+        return []
+    variants = [
+        base,
+        base[:1].upper() + base[1:],
+    ]
+    return [f"Category:{variant}" for variant in _dedupe_preserve_order(variants)]
+
+
+def _add_category_node(
+    nodes: dict[str, CategoryNode],
+    title: str,
+    source: str,
+    query_hit: str | None = None,
+) -> CategoryNode:
+    node = nodes.get(title)
+    if node is None:
+        node = CategoryNode(
+            title=title,
+            parents=[],
+            children=[],
+            query_hits=[],
+            source=source,
+            file_count=0,
+            subcategory_count=0,
+        )
+        nodes[title] = node
+    elif source not in node.source.split("+"):
+        node.source = f"{node.source}+{source}"
+    if query_hit:
+        node.query_hits.append(query_hit)
+    return node
+
+
 def _build_category_graph(
     commons_api: CommonsApi,
     queries: list[str],
@@ -826,34 +928,63 @@ def _build_category_graph(
 ) -> dict[str, Any]:
     print("Building candidate Commons category graph...", flush=True)
     seed_nodes: dict[str, CategoryNode] = {}
+    exact_query_hits_by_title: dict[str, list[str]] = {}
     for query in _dedupe_preserve_order(queries):
         for title in commons_api.search_categories(query, limit_per_query):
-            node = seed_nodes.setdefault(
-                title,
-                CategoryNode(
-                    title=title,
-                    parents=[],
-                    query_hits=[],
-                    source="search",
-                    file_count=0,
-                    subcategory_count=0,
-                ),
-            )
-            node.query_hits.append(query)
-    limited_titles = list(seed_nodes)[:max_candidate_categories]
+            _add_category_node(seed_nodes, title, "search", query)
+        for title in _category_title_variants(query):
+            exact_query_hits_by_title.setdefault(title, []).append(query)
+
+    exact_candidate_titles = _dedupe_preserve_order(list(exact_query_hits_by_title))
+    for title in commons_api.existing_category_titles(exact_candidate_titles):
+        for query in exact_query_hits_by_title.get(title, []):
+            _add_category_node(seed_nodes, title, "exact", query)
+
+    exact_titles = [
+        title for title, node in seed_nodes.items() if "exact" in node.source.split("+")
+    ]
+    exact_title_set = set(exact_titles)
+    other_titles = [title for title in seed_nodes if title not in exact_title_set]
+    limited_titles = (exact_titles + other_titles)[:max_candidate_categories]
+    if len(seed_nodes) > len(limited_titles):
+        limited_set = set(limited_titles)
+        dropped = [title for title in seed_nodes if title not in limited_set]
+        print(
+            "Dropping candidate categories due to max_candidate_categories: "
+            + json.dumps(dropped, ensure_ascii=True),
+            flush=True,
+        )
     graph_nodes: dict[str, CategoryNode] = {
         title: seed_nodes[title] for title in limited_titles
     }
     frontier = list(graph_nodes)
     detailed_titles: set[str] = set()
+    child_lookup_count = 0
     depth = 0
     while frontier and depth < max_parent_depth:
         details_map = commons_api.category_details(frontier)
+        child_lookup_titles: list[str] = []
+        for title in frontier:
+            if child_lookup_count >= commons_api._MAX_CHILD_CATEGORY_LOOKUPS:
+                break
+            node = graph_nodes[title]
+            if depth == 0 or "exact" in node.source.split("+"):
+                child_lookup_titles.append(title)
+                child_lookup_count += 1
+        child_map = commons_api.category_subcategories(
+            child_lookup_titles, max(limit_per_query, 1)
+        )
         next_frontier: list[str] = []
         for title in frontier:
             details = details_map.get(title, {})
             parents = details.get("parents", [])
-            graph_nodes[title].parents = parents
+            children = child_map.get(title, [])
+            graph_nodes[title].parents = _dedupe_preserve_order(
+                graph_nodes[title].parents + parents
+            )
+            graph_nodes[title].children = _dedupe_preserve_order(
+                graph_nodes[title].children + children
+            )
             graph_nodes[title].file_count = int(details.get("file_count", 0))
             graph_nodes[title].subcategory_count = int(
                 details.get("subcategory_count", 0)
@@ -861,15 +992,16 @@ def _build_category_graph(
             detailed_titles.add(title)
             for parent in parents:
                 if parent not in graph_nodes:
-                    graph_nodes[parent] = CategoryNode(
-                        title=parent,
-                        parents=[],
-                        query_hits=[],
-                        source="ancestor",
-                        file_count=0,
-                        subcategory_count=0,
-                    )
-                    next_frontier.append(parent)
+                    _add_category_node(graph_nodes, parent, "ancestor")
+                    if parent not in next_frontier:
+                        next_frontier.append(parent)
+            for child in children:
+                child_node = _add_category_node(graph_nodes, child, "child")
+                child_node.parents = _dedupe_preserve_order(
+                    child_node.parents + [title]
+                )
+                if child not in detailed_titles and child not in next_frontier:
+                    next_frontier.append(child)
         frontier = next_frontier
         depth += 1
     remaining_titles = [title for title in graph_nodes if title not in detailed_titles]
@@ -883,6 +1015,7 @@ def _build_category_graph(
         "nodes": {
             title: {
                 "parents": node.parents,
+                "children": node.children,
                 "query_hits": _dedupe_preserve_order(node.query_hits),
                 "source": node.source,
                 "file_count": node.file_count,
@@ -1000,7 +1133,7 @@ def _html_page(state: dict[str, Any]) -> str:
     if state.get("sha1_matches"):
         sha1_line = ""
         if state.get("raw_sha1sum"):
-            sha1_line = f'<p><code>{escape(state["raw_sha1sum"])}</code></p>'
+            sha1_line = f"<p><code>{escape(state['raw_sha1sum'])}</code></p>"
         match_items = "".join(
             f'<li><a href="{escape(item["url"])}" target="_blank" rel="noreferrer">{escape(item["title"])}</a>'
             f'<button type="button" class="overwrite-btn" data-file-title="{escape(item["title"], quote=True)}">Overwrite this file</button></li>'
@@ -1400,6 +1533,7 @@ def run_app(image_path: Path) -> None:
 
     vision = VisionClient(openai_config)
     commons_api = CommonsApi(commons_config)
+    commons_api.login()
     sha1_matches: list[dict[str, str]] = []
     if metadata.raw_sha1sum:
         sha1_matches = [
@@ -1409,7 +1543,9 @@ def run_app(image_path: Path) -> None:
         if sha1_matches:
             print(
                 "Found Commons files with matching raw SHA1 sum: "
-                + json.dumps([item["title"] for item in sha1_matches], ensure_ascii=True),
+                + json.dumps(
+                    [item["title"] for item in sha1_matches], ensure_ascii=True
+                ),
                 flush=True,
             )
 
@@ -1428,9 +1564,19 @@ def run_app(image_path: Path) -> None:
             user_hint=user_hint,
         )
         print("OpenAI proposal received.", flush=True)
-        category_queries = _dedupe_preserve_order(
+        uncapped_category_queries = _dedupe_preserve_order(
             proposal["search_queries"] + proposal["keywords"]
         )
+        category_queries = uncapped_category_queries[:MAX_CATEGORY_SEARCH_QUERIES]
+        if len(uncapped_category_queries) > len(category_queries):
+            print(
+                "Dropping low-priority category search queries: "
+                + json.dumps(
+                    uncapped_category_queries[MAX_CATEGORY_SEARCH_QUERIES:],
+                    ensure_ascii=True,
+                ),
+                flush=True,
+            )
         print(
             "Category search queries: "
             + json.dumps(category_queries, ensure_ascii=True),
