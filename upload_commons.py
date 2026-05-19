@@ -8,8 +8,10 @@ import json
 import mimetypes
 import os
 import re
+import shutil
 import socket
 import subprocess
+import tempfile
 import threading
 import time
 import webbrowser
@@ -40,6 +42,11 @@ RAW_SHA1_RE = re.compile(
     re.IGNORECASE,
 )
 MAX_CATEGORY_SEARCH_QUERIES = 12
+GPS_EXIF_KEYS = tuple(
+    f"Exif.GPSInfo.{name}"
+    for name in GPS_TAGS.values()
+    if isinstance(name, str) and name.startswith("GPS")
+)
 
 
 @dataclass
@@ -350,6 +357,56 @@ def _downsize_image(image_path: Path, max_dimension: int) -> tuple[bytes, str]:
         output = BytesIO()
         img.save(output, format="JPEG", quality=92)
     return output.getvalue(), "image/jpeg"
+
+
+def _remove_gps_metadata(image_path: Path) -> None:
+    metadata_keys = set(_exiv2_metadata_map(str(image_path)))
+    keys_to_delete = sorted(
+        key
+        for key in metadata_keys
+        if key == "Exif.Image.GPSTag"
+        or key.startswith("Exif.GPSInfo.")
+        or key.startswith("Xmp.exif.GPS")
+    )
+    keys_to_delete.extend(key for key in GPS_EXIF_KEYS if key not in metadata_keys)
+
+    commands = []
+    for key in keys_to_delete:
+        commands.extend(["-M", f"del {key}"])
+    if commands:
+        subprocess.run(
+            ["exiv2", *commands, str(image_path)],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            check=False,
+        )
+    _exiv2_metadata_map.cache_clear()
+
+
+def _upload_safe_image_path(
+    image_path: Path, metadata: PhotoMetadata
+) -> tuple[Path, tempfile.TemporaryDirectory[str] | None]:
+    if metadata.location_allowed:
+        return image_path, None
+
+    temp_dir = tempfile.TemporaryDirectory(prefix="pupphoto-commons-")
+    safe_path = Path(temp_dir.name) / image_path.name
+    shutil.copy2(image_path, safe_path)
+    _remove_gps_metadata(safe_path)
+
+    safe_metadata = _read_metadata(safe_path)
+    if not safe_metadata.location_allowed:
+        temp_dir.cleanup()
+        raise RuntimeError(
+            "Refusing to upload: banned-area GPS metadata is still present after "
+            "scrubbing the upload copy."
+        )
+
+    print(
+        f"GPS metadata is inside a banned area; using scrubbed upload copy {safe_path}",
+        flush=True,
+    )
+    return safe_path, temp_dir
 
 
 def _image_data_url(image_bytes: bytes, mime_type: str) -> str:
@@ -695,6 +752,7 @@ class VisionClient:
                 "keywords": {"type": "array", "items": {"type": "string"}},
                 "search_queries": {"type": "array", "items": {"type": "string"}},
                 "visual_summary": {"type": "string"},
+                "research_summary": {"type": "string"},
             },
             "required": [
                 "filename_stem",
@@ -702,12 +760,15 @@ class VisionClient:
                 "keywords",
                 "search_queries",
                 "visual_summary",
+                "research_summary",
             ],
             "additionalProperties": False,
         }
         instructions = (
             "You are preparing a Wikimedia Commons upload. "
             "Return JSON only. "
+            "Use web search when the image or hint may involve a recently released product, vehicle, train, station, event, public artwork, building, route, operator, or other named subject whose identity or terminology may have changed after model training. "
+            "Search sparingly and only enough to identify current factual names and common terms; do not search for generic visual descriptors. "
             "Write a concise English filename stem using plain ASCII words separated by spaces, "
             "without file extension and without the configured suffix. "
             "Write a concise, factual, neutral, encyclopedic English caption. "
@@ -716,17 +777,22 @@ class VisionClient:
             "Generate search queries for Wikimedia Commons categories that emphasize specific depicted subjects, "
             "locations, events, operators, object classes, and year if relevant. "
             "Generate no more than 8 category search queries, and make each one specific enough to plausibly match a Commons category title. "
+            "Category search queries are for Commons category lookup, not broad web search; every query should contain a named subject, named place, model name, operator, route, event, year, or other concrete identifying context. "
+            "Do not output bare visual, compositional, or object-class descriptors as category search queries; if a viewpoint, lighting condition, part/detail, or object class is categorically useful, combine it with the specific named subject or place. "
             "When the image is described as a subject seen from a named place or viewpoint, include highly specific queries for that relationship, such as "
             '"<subject> from <viewpoint>", "views of <subject> from <viewpoint>", and other exact proper-name combinations that could match an existing Commons category. '
             "Prefer exact proper names over generic descriptions in search queries. "
             "When the time of day or lighting is visually clear and categorically useful, include search queries for that too, such as dusk, sunset, dawn, night, or blue hour, combined with the location if appropriate. "
             "Do not include photographic equipment categories in the search queries; those are handled separately. "
+            "In research_summary, briefly state any web-searched current facts that affected the filename, caption, or category queries; otherwise return an empty string. "
             "Avoid speculation and avoid promotional language. "
             f"The upload workflow will append this suffix later if non-empty: {suffix_hint!r}."
         )
         response = self.client.responses.create(
             model=self.config.vision_model,
-            reasoning={"effort": "high"},
+            reasoning={"effort": "medium"},
+            tools=[{"type": "web_search", "search_context_size": "low"}],
+            max_tool_calls=4,
             input=[
                 {
                     "role": "system",
@@ -762,6 +828,7 @@ class VisionClient:
         metadata: PhotoMetadata,
         proposed_caption: str,
         proposed_summary: str,
+        research_summary: str,
         category_graph: dict[str, Any],
         user_hint: str,
     ) -> dict[str, Any]:
@@ -817,6 +884,8 @@ class VisionClient:
                             + proposed_caption
                             + "\n\nVisual summary:\n"
                             + proposed_summary
+                            + "\n\nCurrent/researched context:\n"
+                            + (research_summary or "(none)")
                             + "\n\nOptional user hint:\n"
                             + (user_hint or "(none)")
                             + "\n\nCandidate category graph JSON:\n"
@@ -1520,6 +1589,7 @@ def run_app(image_path: Path) -> None:
 
     print("Reading image metadata...", flush=True)
     metadata = _read_metadata(image_path)
+    upload_image_path, upload_temp_dir = _upload_safe_image_path(image_path, metadata)
     print(
         "Metadata summary: "
         + json.dumps(metadata.to_model_dict(), sort_keys=True, ensure_ascii=True),
@@ -1565,7 +1635,11 @@ def run_app(image_path: Path) -> None:
         )
         print("OpenAI proposal received.", flush=True)
         uncapped_category_queries = _dedupe_preserve_order(
-            proposal["search_queries"] + proposal["keywords"]
+            [
+                re.sub(r"\s+", " ", str(query).removeprefix("Category:").strip())
+                for query in proposal["search_queries"]
+                if str(query).strip()
+            ]
         )
         category_queries = uncapped_category_queries[:MAX_CATEGORY_SEARCH_QUERIES]
         if len(uncapped_category_queries) > len(category_queries):
@@ -1594,6 +1668,7 @@ def run_app(image_path: Path) -> None:
             metadata=metadata,
             proposed_caption=proposal["caption_en"],
             proposed_summary=proposal["visual_summary"],
+            research_summary=proposal["research_summary"],
             category_graph=category_graph,
             user_hint=user_hint,
         )
@@ -1660,7 +1735,7 @@ def run_app(image_path: Path) -> None:
         )
         try:
             redirect_url = commons_api.upload_file(
-                image_path=image_path,
+                image_path=upload_image_path,
                 filename=filename,
                 description_wikitext=description,
                 summary=f"Uploading {filename} via pupphoto",
@@ -1681,7 +1756,7 @@ def run_app(image_path: Path) -> None:
             return jsonify({"error": "File is not in the matching SHA1 list"}), 400
         try:
             redirect_url = commons_api.overwrite_file(
-                image_path=image_path,
+                image_path=upload_image_path,
                 title=title,
                 summary=f"Uploading new version of {title} via pupphoto",
             )

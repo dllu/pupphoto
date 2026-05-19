@@ -1,4 +1,10 @@
 #!/bin/bash
+if [[ -d /opt/darktable/bin ]]; then
+    export PATH="/opt/darktable/bin:$PATH"
+elif [[ -d /opt/darktable ]]; then
+    export PATH="/opt/darktable:$PATH"
+fi
+
 file="$1"
 base="${file%.jpg}"
 
