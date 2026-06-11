@@ -19,6 +19,13 @@ video_destination = "/home/your-user/videos"
 supported_raw_formats = [".raf", ".dng", ".cr3", ".arw"]
 supported_video_formats = [".mov", ".mp4", ".avi", ".mkv"]
 
+[photo_library]
+hot_root = "/home/your-user/pictures"
+cold_root = "/mnt/dataz/pictures"
+raw_subdir = "raw"
+cooked_subdir = "cooked"
+darktable_cli = "/opt/darktable/bin/darktable-cli"
+
 [upload]
 pictures_dir = "~/Pictures"
 thumb_dir = "~/Pictures/thumbs"
@@ -64,6 +71,11 @@ Run the scripts with `uv run python ...`:
 
 ```bash
 uv run python import.py
+uv run python export_photos.py
+uv run python export_photos.py --root cold
+uv run python export_photos.py --root all --dry-run
+uv run python sync_hot_to_cold.py
+uv run python sync_hot_to_cold.py --dry-run
 uv run python upload_photo.py path/to/photo.jpg
 uv run python upload_clipboard.py path/to/photo.jpg
 uv run python upload_blog.py path/to/photo.jpg

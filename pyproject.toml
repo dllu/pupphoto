@@ -8,6 +8,7 @@ dependencies = [
     "flask",
     "openai",
     "pillow",
+    "pillow-heif>=1.3.0",
     "requests",
     "tqdm",
 ]
@@ -20,9 +21,11 @@ build-backend = "setuptools.build_meta"
 py-modules = [
     "albumize",
     "config",
+    "export_photos",
     "gps",
     "import",
     "open_gps_google_maps",
+    "sync_hot_to_cold",
     "tag_quality_images",
     "upload_blog",
     "upload_clipboard",

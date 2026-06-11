@@ -16,7 +16,7 @@ import threading
 import time
 import webbrowser
 from dataclasses import asdict, dataclass
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 from fractions import Fraction
 from html import escape
 from io import BytesIO
@@ -31,6 +31,7 @@ from PIL import ExifTags, Image, ImageOps
 
 from config import CommonsConfig, OpenAIConfig, load_config
 from gps import is_in_banned_area
+from upload_photo import is_heif_path, save_jpeg_with_metadata, upload_temp_filename
 
 
 Image.MAX_IMAGE_PIXELS = None
@@ -42,6 +43,10 @@ RAW_SHA1_RE = re.compile(
     re.IGNORECASE,
 )
 MAX_CATEGORY_SEARCH_QUERIES = 12
+QUALITY_IMAGE_CANDIDATE_LIST_TITLE = (
+    "Commons:Quality images candidates/candidate list"
+)
+QUALITY_IMAGE_DAILY_NOMINATION_LIMIT = 5
 GPS_EXIF_KEYS = tuple(
     f"Exif.GPSInfo.{name}"
     for name in GPS_TAGS.values()
@@ -386,26 +391,40 @@ def _remove_gps_metadata(image_path: Path) -> None:
 def _upload_safe_image_path(
     image_path: Path, metadata: PhotoMetadata
 ) -> tuple[Path, tempfile.TemporaryDirectory[str] | None]:
-    if metadata.location_allowed:
+    needs_conversion = is_heif_path(image_path)
+    needs_gps_scrub = not metadata.location_allowed
+    if not needs_conversion and not needs_gps_scrub:
         return image_path, None
 
     temp_dir = tempfile.TemporaryDirectory(prefix="pupphoto-commons-")
-    safe_path = Path(temp_dir.name) / image_path.name
-    shutil.copy2(image_path, safe_path)
-    _remove_gps_metadata(safe_path)
-
-    safe_metadata = _read_metadata(safe_path)
-    if not safe_metadata.location_allowed:
-        temp_dir.cleanup()
-        raise RuntimeError(
-            "Refusing to upload: banned-area GPS metadata is still present after "
-            "scrubbing the upload copy."
-        )
-
-    print(
-        f"GPS metadata is inside a banned area; using scrubbed upload copy {safe_path}",
-        flush=True,
+    safe_path = Path(temp_dir.name) / (
+        upload_temp_filename(image_path) if needs_conversion else image_path.name
     )
+    if needs_conversion:
+        with Image.open(image_path) as img:
+            save_jpeg_with_metadata(img, safe_path)
+        print(
+            f"HEIF input detected; using converted JPEG upload copy {safe_path}",
+            flush=True,
+        )
+    else:
+        shutil.copy2(image_path, safe_path)
+
+    if needs_gps_scrub:
+        _remove_gps_metadata(safe_path)
+
+        safe_metadata = _read_metadata(safe_path)
+        if not safe_metadata.location_allowed:
+            temp_dir.cleanup()
+            raise RuntimeError(
+                "Refusing to upload: banned-area GPS metadata is still present after "
+                "scrubbing the upload copy."
+            )
+
+        print(
+            f"GPS metadata is inside a banned area; using scrubbed upload copy {safe_path}",
+            flush=True,
+        )
     return safe_path, temp_dir
 
 
@@ -421,6 +440,117 @@ def _json_schema(name: str, schema: dict[str, Any]) -> dict[str, Any]:
         "strict": True,
         "schema": schema,
     }
+
+
+def _botpassword_owner_username(username: str) -> str:
+    return username.split("@", 1)[0].strip()
+
+
+def _utc_date_label(value: date) -> str:
+    return f"{value.strftime('%B')} {value.day}, {value.year}"
+
+
+def _utc_signature(username: str, timestamp: datetime | None = None) -> str:
+    signed_at = timestamp or datetime.now(timezone.utc)
+    return (
+        f"--[[User:{username}|{username}]] "
+        f"{signed_at:%H:%M}, {_utc_date_label(signed_at.date())} (UTC)"
+    )
+
+
+def _quality_image_description(caption: str, filename: str) -> str:
+    description = re.sub(r"\s+", " ", caption).strip()
+    description = re.sub(r"[\[\]{}|<>]", " ", description)
+    description = re.sub(r"\s+", " ", description).strip(" .,:;")
+    if not description:
+        description = Path(filename).stem.replace("_", " ").strip()
+
+    words = description.split()
+    if len(words) > 14:
+        description = " ".join(words[:14]).strip(" .,:;")
+    if len(description) > 120:
+        description = description[:120].rsplit(" ", 1)[0].strip(" .,:;")
+    return description or Path(filename).stem.replace("_", " ").strip()
+
+
+def _user_signature_patterns(username: str) -> tuple[str, str]:
+    return (f"--[[User:{username}|", f"--[[User:{username}]]")
+
+
+def _section_bounds(wikitext: str, heading: str) -> tuple[int, int] | None:
+    pattern = re.compile(rf"^==\s+{re.escape(heading)}\s+==\s*$", re.MULTILINE)
+    match = pattern.search(wikitext)
+    if not match:
+        return None
+    next_match = re.search(r"^==\s+.+?\s+==\s*$", wikitext[match.end() :], re.MULTILINE)
+    end = match.end() + next_match.start() if next_match else len(wikitext)
+    return match.start(), end
+
+
+def _count_quality_image_nominations(
+    wikitext: str, username: str, date_label: str
+) -> int:
+    bounds = _section_bounds(wikitext, date_label)
+    if bounds is None:
+        return 0
+    section = wikitext[bounds[0] : bounds[1]]
+    signature_patterns = _user_signature_patterns(username)
+    count = 0
+    for line in section.splitlines():
+        stripped = line.strip()
+        if not stripped.startswith("File:") or "{{/" not in stripped:
+            continue
+        nomination_text = re.split(r"<br\s*/?>", stripped, maxsplit=1)[0]
+        if any(pattern in nomination_text for pattern in signature_patterns):
+            count += 1
+    return count
+
+
+def _insert_quality_image_nomination(
+    wikitext: str, date_label: str, nomination_line: str
+) -> str:
+    bounds = _section_bounds(wikitext, date_label)
+    if bounds is not None:
+        section_start, section_end = bounds
+        section = wikitext[section_start:section_end]
+        gallery_match = re.search(r"^<gallery>\s*$", section, re.MULTILINE)
+        if gallery_match:
+            insert_at = section_start + gallery_match.end()
+            return (
+                wikitext[:insert_at]
+                + "\n"
+                + nomination_line
+                + "\n\n"
+                + wikitext[insert_at:].lstrip("\n")
+            )
+        heading_end = wikitext.find("\n", section_start)
+        insert_at = heading_end + 1 if heading_end != -1 else section_end
+        return (
+            wikitext[:insert_at]
+            + "<gallery>\n"
+            + nomination_line
+            + "\n</gallery>\n\n"
+            + wikitext[insert_at:].lstrip("\n")
+        )
+
+    new_section = f"== {date_label} ==\n<gallery>\n{nomination_line}\n</gallery>\n\n"
+    marker = "new nominations -->"
+    marker_index = wikitext.find(marker)
+    if marker_index != -1:
+        insert_at = wikitext.find("\n", marker_index)
+        if insert_at == -1:
+            return wikitext.rstrip() + "\n" + new_section
+        insert_at += 1
+        return wikitext[:insert_at] + new_section + wikitext[insert_at:].lstrip("\n")
+
+    first_date_heading = re.search(r"^==\s+.+?\s+==\s*$", wikitext, re.MULTILINE)
+    if first_date_heading:
+        return (
+            wikitext[: first_date_heading.start()]
+            + new_section
+            + wikitext[first_date_heading.start() :]
+        )
+    return wikitext.rstrip() + "\n\n" + new_section.rstrip() + "\n"
 
 
 class CommonsApi:
@@ -599,6 +729,99 @@ class CommonsApi:
             srlimit=limit,
         )
         return [item["title"] for item in data.get("query", {}).get("search", [])]
+
+    def page_wikitext(self, title: str) -> tuple[str, str, str]:
+        data = self.get(
+            action="query",
+            titles=title,
+            prop="revisions",
+            rvprop="content|timestamp",
+            rvslots="main",
+            curtimestamp="1",
+        )
+        page = data["query"]["pages"][0]
+        if "missing" in page:
+            raise RuntimeError(f"Commons page does not exist: {title}")
+        revision = page["revisions"][0]
+        content = revision["slots"]["main"]["content"]
+        return content, revision["timestamp"], data["curtimestamp"]
+
+    def edit_page(
+        self,
+        title: str,
+        text: str,
+        summary: str,
+        basetimestamp: str,
+        starttimestamp: str,
+    ) -> None:
+        self.login()
+        token = self.csrf_token()
+        data = self.post(
+            action="edit",
+            title=title,
+            text=text,
+            summary=summary,
+            token=token,
+            basetimestamp=basetimestamp,
+            starttimestamp=starttimestamp,
+            notminor="1",
+        )
+        result = data.get("edit", {})
+        if result.get("result") != "Success":
+            raise RuntimeError(f"Commons edit failed: {result}")
+
+    def quality_image_nomination_count(
+        self, username: str, nomination_date: date
+    ) -> int:
+        wikitext, _basetimestamp, _starttimestamp = self.page_wikitext(
+            QUALITY_IMAGE_CANDIDATE_LIST_TITLE
+        )
+        return _count_quality_image_nominations(
+            wikitext, username, _utc_date_label(nomination_date)
+        )
+
+    def nominate_quality_image(
+        self,
+        file_title: str,
+        description: str,
+        username: str,
+        timestamp: datetime | None = None,
+    ) -> int:
+        now = timestamp or datetime.now(timezone.utc)
+        date_label = _utc_date_label(now.date())
+        wikitext, basetimestamp, starttimestamp = self.page_wikitext(
+            QUALITY_IMAGE_CANDIDATE_LIST_TITLE
+        )
+        existing_count = _count_quality_image_nominations(
+            wikitext, username, date_label
+        )
+        if existing_count >= QUALITY_IMAGE_DAILY_NOMINATION_LIMIT:
+            raise RuntimeError(
+                "Refusing Quality Image nomination: "
+                f"{username} already has {existing_count} nominations on "
+                f"{date_label} UTC."
+            )
+
+        if f"{file_title}|" in wikitext:
+            raise RuntimeError(
+                f"Refusing Quality Image nomination: {file_title} is already listed."
+            )
+
+        nomination_line = (
+            f"{file_title}|{{{{/Nomination|{description} "
+            f"{_utc_signature(username, now)}|}}}}"
+        )
+        updated_wikitext = _insert_quality_image_nomination(
+            wikitext, date_label, nomination_line
+        )
+        self.edit_page(
+            QUALITY_IMAGE_CANDIDATE_LIST_TITLE,
+            updated_wikitext,
+            f"Nominate {file_title} for Quality Image",
+            basetimestamp,
+            starttimestamp,
+        )
+        return existing_count + 1
 
     def category_exists(self, title: str) -> bool:
         pages = self.get(action="query", titles=title)["query"]["pages"]
@@ -1217,6 +1440,17 @@ def _html_page(state: dict[str, Any]) -> str:
             + match_items
             + "</ul></div>"
         )
+    qi_count = int(state.get("quality_image_nominations_today", 0))
+    qi_limit = int(state.get("quality_image_nomination_limit", 5))
+    qi_date = str(state.get("quality_image_nomination_date", "today"))
+    qi_warning = ""
+    if qi_count >= qi_limit:
+        qi_warning = (
+            '<p class="inline-warning">'
+            f"{escape(str(qi_count))}/{escape(str(qi_limit))} Quality Image "
+            f"nominations already listed for {escape(qi_date)} UTC."
+            "</p>"
+        )
     return f"""<!doctype html>
 <html lang="en">
 <head>
@@ -1366,6 +1600,26 @@ def _html_page(state: dict[str, Any]) -> str:
       align-items: center;
       flex-wrap: wrap;
     }}
+    .checkbox-row {{
+      display: flex;
+      gap: 10px;
+      align-items: flex-start;
+      margin-top: 16px;
+      font-weight: 700;
+    }}
+    .checkbox-row input {{
+      margin-top: 4px;
+    }}
+    .inline-note, .inline-warning {{
+      margin: 8px 0 0 28px;
+      font-size: 14px;
+      line-height: 1.4;
+      color: #5f4635;
+    }}
+    .inline-warning {{
+      color: #8e3b1b;
+      font-weight: 700;
+    }}
     .spinner {{
       width: 18px;
       height: 18px;
@@ -1434,6 +1688,12 @@ def _html_page(state: dict[str, Any]) -> str:
         <label>Categories</label>
         <div id="categories"></div>
         <button type="button" class="secondary" id="add-category">Add category</button>
+        <label class="checkbox-row">
+          <input id="quality-image" type="checkbox" {"disabled" if qi_count >= qi_limit else ""}>
+          <span>Nominate as Quality Image</span>
+        </label>
+        <p class="inline-note">{escape(str(qi_count))}/{escape(str(qi_limit))} Quality Image nominations listed for {escape(qi_date)} UTC.</p>
+        {qi_warning}
         <div class="actions">
           <button type="button" class="primary" id="submit">Save and upload</button>
         </div>
@@ -1534,6 +1794,7 @@ def _html_page(state: dict[str, Any]) -> str:
         categories: Array.from(document.querySelectorAll(".category-input"))
           .map((node) => node.value.trim())
           .filter(Boolean),
+        nominate_quality_image: document.getElementById("quality-image").checked,
       }};
       const response = await fetch("/submit", {{
         method: "POST",
@@ -1604,6 +1865,17 @@ def run_app(image_path: Path) -> None:
     vision = VisionClient(openai_config)
     commons_api = CommonsApi(commons_config)
     commons_api.login()
+    commons_username = _botpassword_owner_username(commons_config.username)
+    quality_image_nomination_date = datetime.now(timezone.utc).date()
+    quality_image_nominations_today = commons_api.quality_image_nomination_count(
+        commons_username, quality_image_nomination_date
+    )
+    print(
+        "Quality Image nominations today: "
+        f"{quality_image_nominations_today}/"
+        f"{QUALITY_IMAGE_DAILY_NOMINATION_LIMIT}",
+        flush=True,
+    )
     sha1_matches: list[dict[str, str]] = []
     if metadata.raw_sha1sum:
         sha1_matches = [
@@ -1623,6 +1895,11 @@ def run_app(image_path: Path) -> None:
         "metadata": metadata.to_model_dict(),
         "raw_sha1sum": metadata.raw_sha1sum,
         "sha1_matches": sha1_matches,
+        "quality_image_nominations_today": quality_image_nominations_today,
+        "quality_image_nomination_limit": QUALITY_IMAGE_DAILY_NOMINATION_LIMIT,
+        "quality_image_nomination_date": _utc_date_label(
+            quality_image_nomination_date
+        ),
     }
 
     def generate_review_state(user_hint: str) -> dict[str, Any]:
@@ -1690,7 +1967,7 @@ def run_app(image_path: Path) -> None:
             "filename": _preferred_filename(
                 proposal["filename_stem"],
                 commons_config.filename_suffix,
-                image_path.suffix,
+                upload_image_path.suffix,
             ),
             "caption": proposal["caption_en"],
             "categories": all_categories,
@@ -1721,7 +1998,7 @@ def run_app(image_path: Path) -> None:
         payload = request.get_json(force=True)
         filename_input = payload["filename"].strip()
         stem = Path(filename_input).stem if filename_input else image_path.stem
-        filename = _preferred_filename(stem, "", image_path.suffix)
+        filename = _preferred_filename(stem, "", upload_image_path.suffix)
         caption = payload["caption"].strip()
         categories = _dedupe_preserve_order(
             [item.strip() for item in payload["categories"] if item.strip()]
@@ -1734,12 +2011,38 @@ def run_app(image_path: Path) -> None:
             categories=categories,
         )
         try:
+            if payload.get("nominate_quality_image"):
+                nominations_today = commons_api.quality_image_nomination_count(
+                    commons_username, datetime.now(timezone.utc).date()
+                )
+                if nominations_today >= QUALITY_IMAGE_DAILY_NOMINATION_LIMIT:
+                    return (
+                        jsonify(
+                            {
+                                "error": (
+                                    "Quality Image nomination limit reached: "
+                                    f"{nominations_today}/"
+                                    f"{QUALITY_IMAGE_DAILY_NOMINATION_LIMIT} "
+                                    "nominations are already listed for today UTC."
+                                )
+                            }
+                        ),
+                        400,
+                    )
             redirect_url = commons_api.upload_file(
                 image_path=upload_image_path,
                 filename=filename,
                 description_wikitext=description,
                 summary=f"Uploading {filename} via pupphoto",
             )
+            if payload.get("nominate_quality_image"):
+                file_title = f"File:{filename}"
+                qi_description = _quality_image_description(caption, filename)
+                commons_api.nominate_quality_image(
+                    file_title=file_title,
+                    description=qi_description,
+                    username=commons_username,
+                )
         except Exception as exc:
             return jsonify({"error": str(exc)}), 500
         _schedule_exit()

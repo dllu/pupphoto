@@ -55,6 +55,26 @@ class ImportConfig:
 
 
 @dataclass
+class PhotoLibraryConfig:
+    hot_root: Path
+    cold_root: Path
+    raw_subdir: str = "raw"
+    cooked_subdir: str = "cooked"
+    darktable_cli: str = "darktable-cli"
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any], base_dir: Path) -> "PhotoLibraryConfig":
+        kwargs = _section_kwargs(cls, data)
+        return cls(
+            hot_root=_expand_path(kwargs["hot_root"], base_dir),
+            cold_root=_expand_path(kwargs["cold_root"], base_dir),
+            raw_subdir=kwargs.get("raw_subdir", cls.raw_subdir),
+            cooked_subdir=kwargs.get("cooked_subdir", cls.cooked_subdir),
+            darktable_cli=kwargs.get("darktable_cli", cls.darktable_cli),
+        )
+
+
+@dataclass
 class UploadConfig:
     pictures_dir: Path
     thumb_dir: Path
@@ -149,6 +169,7 @@ class CommonsConfig:
 @dataclass
 class AppConfig:
     import_config: ImportConfig
+    photo_library: PhotoLibraryConfig
     upload: UploadConfig
     album: AlbumConfig
     openai: OpenAIConfig
@@ -159,6 +180,7 @@ class AppConfig:
     def from_dict(cls, data: dict[str, Any], base_dir: Path) -> "AppConfig":
         return cls(
             import_config=ImportConfig.from_dict(data["import"], base_dir),
+            photo_library=PhotoLibraryConfig.from_dict(data["photo_library"], base_dir),
             upload=UploadConfig.from_dict(data["upload"], base_dir),
             album=AlbumConfig.from_dict(data["album"], base_dir),
             openai=OpenAIConfig.from_dict(data["openai"], base_dir),
@@ -174,6 +196,11 @@ class AppConfig:
                 "camera_dir": str(self.import_config.camera_dir),
                 "photo_destination": str(self.import_config.photo_destination),
                 "video_destination": str(self.import_config.video_destination),
+            },
+            "photo_library": {
+                **raw["photo_library"],
+                "hot_root": str(self.photo_library.hot_root),
+                "cold_root": str(self.photo_library.cold_root),
             },
             "upload": {
                 **raw["upload"],

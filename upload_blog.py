@@ -2,10 +2,9 @@
 
 import argparse
 import shutil
-from pathlib import Path
 
 from config import load_config
-from upload_photo import upload_photo
+from upload_photo import upload_photo, upload_temp_filename
 
 
 def main() -> None:
@@ -19,10 +18,10 @@ def main() -> None:
     full_size_link = upload_photo(
         args.src_file,
         clipboard=True,
-        clipboard_format="pic {url} : ",
+        clipboard_format="![]({url})",
     )
     dst_filename = full_size_link.rsplit("/", 1)[-1]
-    processed_path = config.thumb_dir / Path(args.src_file).name
+    processed_path = config.thumb_dir / upload_temp_filename(args.src_file)
     if not processed_path.is_file():
         raise SystemExit(f"Processed photo not found at {processed_path}")
 
@@ -30,7 +29,7 @@ def main() -> None:
     dest_file = config.blog_image_dir / dst_filename
     shutil.copy2(processed_path, dest_file)
 
-    output = f"pic {full_size_link} : "
+    output = f"![]({full_size_link})"
     print(output)
     print(f"Copied {processed_path} to {dest_file}")
 
