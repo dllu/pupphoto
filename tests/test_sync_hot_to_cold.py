@@ -7,7 +7,9 @@ from sync_hot_to_cold import build_rsync_command, directory_arg, validate_roots
 
 class SyncHotToColdTest(unittest.TestCase):
     def test_directory_arg_adds_trailing_slash(self) -> None:
-        self.assertEqual(directory_arg(Path("/home/example/pictures")), "/home/example/pictures/")
+        self.assertEqual(
+            directory_arg(Path("/home/example/pictures")), "/home/example/pictures/"
+        )
 
     def test_build_rsync_command_syncs_directory_contents_without_delete(self) -> None:
         command = build_rsync_command(

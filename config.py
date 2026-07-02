@@ -145,7 +145,8 @@ class CommonsConfig:
     max_parent_depth: int
     ui_host: str
     quality_images_category: str
-    quality_images_scan_limit: int
+    featured_pictures_category: str
+    valued_images_category: str
 
     @classmethod
     def from_dict(cls, data: dict[str, Any], base_dir: Path) -> "CommonsConfig":
@@ -162,7 +163,8 @@ class CommonsConfig:
             max_parent_depth=kwargs["max_parent_depth"],
             ui_host=kwargs["ui_host"],
             quality_images_category=kwargs["quality_images_category"],
-            quality_images_scan_limit=kwargs["quality_images_scan_limit"],
+            featured_pictures_category=kwargs.get("featured_pictures_category", ""),
+            valued_images_category=kwargs.get("valued_images_category", ""),
         )
 
 

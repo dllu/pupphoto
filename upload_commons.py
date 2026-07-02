@@ -42,10 +42,11 @@ RAW_SHA1_RE = re.compile(
     r"^\d{4}-\d{2}-\d{2}-\d{2}-\d{2}-\d{2}_.+_([0-9a-f]{40})\.[^.]+$",
     re.IGNORECASE,
 )
-MAX_CATEGORY_SEARCH_QUERIES = 12
-QUALITY_IMAGE_CANDIDATE_LIST_TITLE = (
-    "Commons:Quality images candidates/candidate list"
-)
+MAX_CATEGORY_SEARCH_QUERIES = 8
+MAX_CATEGORY_RELATIONSHIP_QUERIES = 2
+MAX_CATEGORY_INTERSECTION_PAIRS = 1
+MAX_CATEGORY_INTERSECTION_RESULTS = 8
+QUALITY_IMAGE_CANDIDATE_LIST_TITLE = "Commons:Quality images candidates/candidate list"
 QUALITY_IMAGE_DAILY_NOMINATION_LIMIT = 5
 GPS_EXIF_KEYS = tuple(
     f"Exif.GPSInfo.{name}"
@@ -702,6 +703,44 @@ class CommonsApi:
         )
         return [item["title"] for item in data.get("query", {}).get("search", [])]
 
+    def search_category_intersections(
+        self,
+        category_pairs: list[tuple[str, str]],
+        limit: int,
+    ) -> dict[str, dict[str, Any]]:
+        query = _category_intersection_query(category_pairs)
+        if not query:
+            return {}
+        print("Searching Commons for shared child categories...", flush=True)
+        data = self.get(
+            action="query",
+            generator="search",
+            gsrsearch=query,
+            gsrnamespace="14",
+            gsrwhat="text",
+            gsrlimit=limit,
+            prop="categories|categoryinfo",
+            cllimit="max",
+            clshow="!hidden",
+        )
+        pages = sorted(
+            data.get("query", {}).get("pages", []),
+            key=lambda page: int(page.get("index", 0)),
+        )
+        result: dict[str, dict[str, Any]] = {}
+        for page in pages:
+            if "missing" in page or page.get("ns") != 14:
+                continue
+            info = page.get("categoryinfo", {})
+            result[page["title"]] = {
+                "parents": [
+                    category["title"] for category in page.get("categories", [])
+                ],
+                "file_count": int(info.get("files", 0)),
+                "subcategory_count": int(info.get("subcats", 0)),
+            }
+        return result
+
     def existing_category_titles(self, titles: list[str]) -> list[str]:
         if not titles:
             return []
@@ -974,6 +1013,10 @@ class VisionClient:
                 "caption_en": {"type": "string"},
                 "keywords": {"type": "array", "items": {"type": "string"}},
                 "search_queries": {"type": "array", "items": {"type": "string"}},
+                "relationship_queries": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                },
                 "visual_summary": {"type": "string"},
                 "research_summary": {"type": "string"},
             },
@@ -982,6 +1025,7 @@ class VisionClient:
                 "caption_en",
                 "keywords",
                 "search_queries",
+                "relationship_queries",
                 "visual_summary",
                 "research_summary",
             ],
@@ -997,9 +1041,19 @@ class VisionClient:
             "Write a concise, factual, neutral, encyclopedic English caption. "
             "Treat the optional user hint as high-priority factual context when it provides names, locations, dates, events, or the shooting viewpoint. "
             "Silently correct likely misspellings in the user hint when generating the caption, keywords, and category search queries. "
+            "Before generating metadata, actively inspect the image for discriminating clues such as visible text, model or serial numbers, logos, badges, signage, inscriptions, distinctive physical features, and location markers. "
+            "Use those clues to identify depicted subjects as specifically as reasonably possible. "
+            "When a clue could resolve a more precise identity, verify it with web search rather than stopping at a generic object class or guessing. "
+            "Include each verified specific identity in the caption, keywords, and category search queries when relevant. "
+            "Also identify visually central relationships, combinations, or states involving those subjects, such as an adult animal with its juvenile, a person performing an activity, a vehicle at a named place, or an object displaying or using another object. "
+            "Put no more than two high-value Commons category lookup phrases for such combinations in relationship_queries, using an empty array when none applies. "
+            "Phrase relationship queries like plausible Commons category titles, include the specific species, model, person, place, or other identity needed to disambiguate them, and do not invent a relationship that is not visually supported. "
             "Generate search queries for Wikimedia Commons categories that emphasize specific depicted subjects, "
             "locations, events, operators, object classes, and year if relevant. "
-            "Generate no more than 8 category search queries, and make each one specific enough to plausibly match a Commons category title. "
+            "Generate no more than 8 category lookup queries in total across search_queries and relationship_queries, and make each one specific enough to plausibly match a Commons category title. "
+            "Within that limit, prioritize one standalone query containing only the concise canonical name of each central specifically identified subject. "
+            "Do not add an expanded operator or organization name, serial or vehicle number, location, date, or descriptive terms to that standalone query; put useful combinations in separate additional queries. "
+            'For example, use both "<canonical subject name>" and, when relevant, "<canonical subject name> at <location>" rather than using only the combined query. '
             "Category search queries are for Commons category lookup, not broad web search; every query should contain a named subject, named place, model name, operator, route, event, year, or other concrete identifying context. "
             "Do not output bare visual, compositional, or object-class descriptors as category search queries; if a viewpoint, lighting condition, part/detail, or object class is categorically useful, combine it with the specific named subject or place. "
             "When the image is described as a subject seen from a named place or viewpoint, include highly specific queries for that relationship, such as "
@@ -1175,6 +1229,27 @@ def _dedupe_preserve_order(values: list[str]) -> list[str]:
     return result
 
 
+def _category_intersection_query(category_pairs: list[tuple[str, str]]) -> str:
+    def quoted_category(category: str) -> str:
+        value = category.removeprefix("Category:")
+        return value.replace("\\", "\\\\").replace('"', '\\"')
+
+    return " OR ".join(
+        f'incategory:"{quoted_category(left)}" incategory:"{quoted_category(right)}"'
+        for left, right in category_pairs
+    )
+
+
+def _category_title_supported_by_evidence(title: str, evidence: list[str]) -> bool:
+    normalized_title = " ".join(
+        re.findall(r"[^\W_]+", title.removeprefix("Category:").casefold())
+    )
+    normalized_evidence = " ".join(
+        re.findall(r"[^\W_]+", " ".join(evidence).casefold())
+    )
+    return bool(normalized_title) and normalized_title in normalized_evidence
+
+
 def _category_title_variants(query: str) -> list[str]:
     base = re.sub(r"\s+", " ", query.removeprefix("Category:").strip())
     if not base:
@@ -1334,13 +1409,14 @@ def _remove_ancestor_duplicates(
             stack.extend(node_map.get(parent, {}).get("parents", []))
         return {item.removeprefix("Category:") for item in seen}
 
-    selected_set = set(selected_categories)
-    filtered: list[str] = []
+    selected_ancestors: set[str] = set()
     for category in selected_categories:
-        if selected_set.intersection(ancestors_of(category)):
-            continue
-        filtered.append(category)
-    return filtered
+        selected_ancestors.update(ancestors_of(category))
+    return [
+        category
+        for category in selected_categories
+        if category not in selected_ancestors
+    ]
 
 
 def _remove_empty_categories(
@@ -1362,6 +1438,84 @@ def _remove_empty_categories(
             flush=True,
         )
     return filtered
+
+
+def _refine_category_intersections(
+    commons_api: CommonsApi,
+    selected_categories: list[str],
+    graph: dict[str, Any],
+    evidence: list[str],
+) -> list[str]:
+    if len(selected_categories) < 2:
+        return selected_categories
+
+    graph_nodes = graph.setdefault("nodes", {})
+    ranked_pairs: list[tuple[int, int, int, tuple[str, str]]] = []
+    pair_index = 0
+    for left_index, left in enumerate(selected_categories):
+        for right in selected_categories[left_index + 1 :]:
+            left_title = f"Category:{left}"
+            right_title = f"Category:{right}"
+            left_parents = set(graph_nodes.get(left_title, {}).get("parents", []))
+            right_parents = set(graph_nodes.get(right_title, {}).get("parents", []))
+            left_tokens = set(re.findall(r"[^\W_]+", left.casefold()))
+            right_tokens = set(re.findall(r"[^\W_]+", right.casefold()))
+            ranked_pairs.append(
+                (
+                    len(left_parents.intersection(right_parents)),
+                    len(left_tokens.intersection(right_tokens)),
+                    -pair_index,
+                    (left, right),
+                )
+            )
+            pair_index += 1
+    ranked_pairs.sort(reverse=True)
+    category_pairs = [
+        pair for _, _, _, pair in ranked_pairs[:MAX_CATEGORY_INTERSECTION_PAIRS]
+    ]
+
+    intersection_details = commons_api.search_category_intersections(
+        category_pairs,
+        MAX_CATEGORY_INTERSECTION_RESULTS,
+    )
+    selected_titles = {f"Category:{category}" for category in selected_categories}
+    refinements: list[str] = []
+    for title, details in intersection_details.items():
+        parents = _dedupe_preserve_order(details.get("parents", []))
+        selected_parents = selected_titles.intersection(parents)
+        if len(selected_parents) < 2:
+            continue
+        if int(details.get("file_count", 0)) <= 0:
+            continue
+        if not _category_title_supported_by_evidence(title, evidence):
+            continue
+        graph_nodes[title] = {
+            "parents": parents,
+            "children": [],
+            "query_hits": [],
+            "source": "intersection",
+            "file_count": int(details.get("file_count", 0)),
+            "subcategory_count": int(details.get("subcategory_count", 0)),
+        }
+        for parent in parents:
+            parent_node = graph_nodes.get(parent)
+            if parent_node is not None:
+                parent_node["children"] = _dedupe_preserve_order(
+                    parent_node.get("children", []) + [title]
+                )
+        refinements.append(title.removeprefix("Category:"))
+
+    if not refinements:
+        return selected_categories
+    print(
+        "Refining selected categories with shared child categories: "
+        + json.dumps(refinements, ensure_ascii=True),
+        flush=True,
+    )
+    return _remove_ancestor_duplicates(
+        _dedupe_preserve_order(selected_categories + refinements),
+        graph,
+    )
 
 
 def _wikitext_categories(categories: list[str]) -> str:
@@ -1897,9 +2051,7 @@ def run_app(image_path: Path) -> None:
         "sha1_matches": sha1_matches,
         "quality_image_nominations_today": quality_image_nominations_today,
         "quality_image_nomination_limit": QUALITY_IMAGE_DAILY_NOMINATION_LIMIT,
-        "quality_image_nomination_date": _utc_date_label(
-            quality_image_nomination_date
-        ),
+        "quality_image_nomination_date": _utc_date_label(quality_image_nomination_date),
     }
 
     def generate_review_state(user_hint: str) -> dict[str, Any]:
@@ -1911,8 +2063,21 @@ def run_app(image_path: Path) -> None:
             user_hint=user_hint,
         )
         print("OpenAI proposal received.", flush=True)
-        uncapped_category_queries = _dedupe_preserve_order(
+        relationship_queries = _dedupe_preserve_order(
             [
+                re.sub(r"\s+", " ", str(query).removeprefix("Category:").strip())
+                for query in proposal["relationship_queries"]
+                if str(query).strip()
+            ]
+        )[:MAX_CATEGORY_RELATIONSHIP_QUERIES]
+        print(
+            "Category relationship queries: "
+            + json.dumps(relationship_queries, ensure_ascii=True),
+            flush=True,
+        )
+        uncapped_category_queries = _dedupe_preserve_order(
+            relationship_queries
+            + [
                 re.sub(r"\s+", " ", str(query).removeprefix("Category:").strip())
                 for query in proposal["search_queries"]
                 if str(query).strip()
@@ -1955,6 +2120,19 @@ def run_app(image_path: Path) -> None:
         ]
         model_categories = _remove_empty_categories(model_categories, category_graph)
         model_categories = _remove_ancestor_duplicates(model_categories, category_graph)
+        model_categories = _refine_category_intersections(
+            commons_api,
+            model_categories,
+            category_graph,
+            evidence=[
+                proposal["caption_en"],
+                proposal["visual_summary"],
+                proposal["research_summary"],
+                user_hint,
+                *proposal["keywords"],
+                *relationship_queries,
+            ],
+        )
         equipment_categories = _resolve_equipment_categories(commons_api, metadata)
         all_categories = _dedupe_preserve_order(model_categories + equipment_categories)
         print(

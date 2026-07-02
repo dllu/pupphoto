@@ -8,10 +8,13 @@ from PIL import Image, ImageCms
 
 from upload_commons import (
     PhotoMetadata,
+    _category_intersection_query,
     _count_quality_image_nominations,
     _insert_quality_image_nomination,
     _quality_image_description,
     _read_metadata,
+    _refine_category_intersections,
+    _remove_ancestor_duplicates,
     _remove_gps_metadata,
     _utc_date_label,
     _utc_signature,
@@ -98,7 +101,9 @@ class UploadSafeImagePathTest(unittest.TestCase):
         with (
             patch("builtins.print"),
             patch("upload_commons._remove_gps_metadata") as scrub,
-            patch("upload_commons._read_metadata", return_value=_metadata(True)) as read,
+            patch(
+                "upload_commons._read_metadata", return_value=_metadata(True)
+            ) as read,
         ):
             safe_path, temp_dir = _upload_safe_image_path(image_path, _metadata(False))
 
@@ -109,7 +114,9 @@ class UploadSafeImagePathTest(unittest.TestCase):
         scrub.assert_called_once_with(safe_path)
         read.assert_called_once_with(safe_path)
 
-    def test_banned_location_refuses_if_scrubbed_copy_still_has_banned_gps(self) -> None:
+    def test_banned_location_refuses_if_scrubbed_copy_still_has_banned_gps(
+        self,
+    ) -> None:
         source_dir = self.enterContext(tempfile.TemporaryDirectory())
         image_path = Path(source_dir) / "photo.jpg"
         image_path.write_bytes(b"fake image")
@@ -141,6 +148,150 @@ class UploadSafeImagePathTest(unittest.TestCase):
         scrubbed_metadata = _read_metadata(image_path)
         self.assertIsNone(scrubbed_metadata.latitude)
         self.assertIsNone(scrubbed_metadata.longitude)
+
+
+class CategorySelectionTest(unittest.TestCase):
+    class FakeCommonsApi:
+        def __init__(self, details: dict[str, dict[str, object]]) -> None:
+            self.details = details
+            self.calls: list[tuple[list[tuple[str, str]], int]] = []
+
+        def search_category_intersections(
+            self,
+            category_pairs: list[tuple[str, str]],
+            limit: int,
+        ) -> dict[str, dict[str, object]]:
+            self.calls.append((category_pairs, limit))
+            return self.details
+
+    def test_removes_selected_ancestor_and_keeps_specific_descendants(self) -> None:
+        graph = {
+            "nodes": {
+                "Category:Nankai 50000 series": {"parents": ["Category:Rapi:t"]},
+                "Category:Rapi:t": {"parents": ["Category:Nankai Main Line"]},
+                "Category:Trains at Imamiyaebisu Station": {
+                    "parents": ["Category:Imamiyaebisu Station"]
+                },
+                "Category:Imamiyaebisu Station": {
+                    "parents": ["Category:Stations of Nankai Main Line"]
+                },
+                "Category:Stations of Nankai Main Line": {
+                    "parents": ["Category:Nankai Main Line"]
+                },
+                "Category:Nankai Main Line": {"parents": []},
+            }
+        }
+
+        result = _remove_ancestor_duplicates(
+            [
+                "Nankai Main Line",
+                "Nankai 50000 series",
+                "Trains at Imamiyaebisu Station",
+            ],
+            graph,
+        )
+
+        self.assertEqual(
+            result,
+            ["Nankai 50000 series", "Trains at Imamiyaebisu Station"],
+        )
+
+    def test_intersection_query_uses_bounded_shared_category_search(self) -> None:
+        query = _category_intersection_query(
+            [("Cervus nippon (female)", 'Cervus nippon (juvenile "young")')]
+        )
+
+        self.assertEqual(
+            query,
+            'incategory:"Cervus nippon (female)" '
+            'incategory:"Cervus nippon (juvenile \\"young\\")"',
+        )
+
+    def test_refines_selected_categories_to_supported_shared_child(self) -> None:
+        graph = {
+            "nodes": {
+                "Category:Cervus nippon (female)": {
+                    "parents": ["Category:Cervus nippon"],
+                    "children": [],
+                },
+                "Category:Cervus nippon (juvenile)": {
+                    "parents": ["Category:Cervus nippon"],
+                    "children": [],
+                },
+                "Category:Cervus nippon": {"parents": [], "children": []},
+                "Category:Deer in Nara": {
+                    "parents": ["Category:Deer in Japan"],
+                    "children": [],
+                },
+            }
+        }
+        api = self.FakeCommonsApi(
+            {
+                "Category:Cervus nippon (doe with fawn)": {
+                    "parents": [
+                        "Category:Cervidae (female with juvenile)",
+                        "Category:Cervus nippon (female)",
+                        "Category:Cervus nippon (juvenile)",
+                    ],
+                    "file_count": 31,
+                    "subcategory_count": 0,
+                }
+            }
+        )
+
+        with patch("builtins.print"):
+            result = _refine_category_intersections(
+                api,
+                [
+                    "Deer in Nara",
+                    "Cervus nippon (female)",
+                    "Cervus nippon (juvenile)",
+                ],
+                graph,
+                ["Sika deer (Cervus nippon) doe with fawn in Nara Park."],
+            )
+
+        self.assertEqual(
+            result,
+            ["Deer in Nara", "Cervus nippon (doe with fawn)"],
+        )
+        self.assertEqual(len(api.calls), 1)
+        self.assertEqual(
+            api.calls[0][0],
+            [("Cervus nippon (female)", "Cervus nippon (juvenile)")],
+        )
+
+    def test_does_not_apply_shared_child_unsupported_by_evidence(self) -> None:
+        graph = {
+            "nodes": {
+                "Category:Cervus nippon (female)": {"parents": [], "children": []},
+                "Category:Cervus nippon (juvenile)": {"parents": [], "children": []},
+            }
+        }
+        api = self.FakeCommonsApi(
+            {
+                "Category:Cervus nippon in zoos": {
+                    "parents": [
+                        "Category:Cervus nippon (female)",
+                        "Category:Cervus nippon (juvenile)",
+                    ],
+                    "file_count": 10,
+                    "subcategory_count": 0,
+                }
+            }
+        )
+
+        result = _refine_category_intersections(
+            api,
+            ["Cervus nippon (female)", "Cervus nippon (juvenile)"],
+            graph,
+            ["Sika deer doe with fawn in Nara Park."],
+        )
+
+        self.assertEqual(
+            result,
+            ["Cervus nippon (female)", "Cervus nippon (juvenile)"],
+        )
 
 
 class QualityImageNominationTest(unittest.TestCase):
@@ -190,7 +341,9 @@ File:Existing.jpg|{{/Nomination|Existing --[[User:Someone|Someone]] 01:00, May 1
         )
 
         self.assertIn("<gallery>\nFile:New.jpg", updated)
-        self.assertLess(updated.index("File:New.jpg"), updated.index("File:Existing.jpg"))
+        self.assertLess(
+            updated.index("File:New.jpg"), updated.index("File:Existing.jpg")
+        )
 
     def test_insert_quality_image_nomination_new_utc_day_section(self) -> None:
         wikitext = """=Nominations=
@@ -208,7 +361,9 @@ File:Existing.jpg|{{/Nomination|Existing --[[User:Someone|Someone]] 01:00, May 1
             "File:New.jpg|{{/Nomination|New --[[User:Example|Example]] 03:04, May 19, 2026 (UTC)|}}",
         )
 
-        self.assertLess(updated.index("== May 19, 2026 =="), updated.index("== May 18, 2026 =="))
+        self.assertLess(
+            updated.index("== May 19, 2026 =="), updated.index("== May 18, 2026 ==")
+        )
         self.assertIn("== May 19, 2026 ==\n<gallery>\nFile:New.jpg", updated)
 
     def test_quality_image_description_is_terse_and_template_safe(self) -> None:

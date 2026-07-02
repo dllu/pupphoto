@@ -26,7 +26,7 @@ py-modules = [
     "import",
     "open_gps_google_maps",
     "sync_hot_to_cold",
-    "tag_quality_images",
+    "tag_promoted_images",
     "upload_blog",
     "upload_clipboard",
     "upload_commons",
