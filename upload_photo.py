@@ -1,16 +1,13 @@
 import argparse
 import hashlib
-import os
-import shutil
+import re
 import subprocess
-import sys
 from pathlib import Path
-from struct import error as StructError
-from struct import pack, unpack
 
 from PIL import Image, JpegImagePlugin
 from pillow_heif import register_heif_opener
 
+from clipboard_util import copy_to_clipboard
 from config import load_config
 from gps import remove_gps_if_banned
 
@@ -19,7 +16,17 @@ register_heif_opener()
 
 HEIF_SUFFIXES = {".heic", ".heics", ".heif", ".heifs", ".hif"}
 JPEG_SUFFIX = ".jpg"
+JPEG_SUFFIXES = {".jpg", ".jpeg"}
 EXIF_ORIENTATION_TAG = 274
+ORIENTATION_TRANSPOSE_METHODS = {
+    2: Image.Transpose.FLIP_LEFT_RIGHT,
+    3: Image.Transpose.ROTATE_180,
+    4: Image.Transpose.FLIP_TOP_BOTTOM,
+    5: Image.Transpose.TRANSPOSE,
+    6: Image.Transpose.ROTATE_270,
+    7: Image.Transpose.TRANSVERSE,
+    8: Image.Transpose.ROTATE_90,
+}
 
 
 def is_heif_path(path: Path | str) -> bool:
@@ -33,81 +40,153 @@ def upload_temp_filename(src_file: Path | str, resize: int | None = None) -> str
     return f"{src_path.stem}{resize_suffix}{output_suffix}"
 
 
-def _restore_exif_orientation(
-    exif_bytes: bytes | None, orientation: int | None
-) -> bytes | None:
-    if not exif_bytes or orientation is None:
-        return exif_bytes
-
+def _valid_orientation(value: object) -> int | None:
     try:
-        orientation = int(orientation)
+        orientation = int(value)
     except (TypeError, ValueError):
-        return exif_bytes
-    if not 1 <= orientation <= 8:
-        return exif_bytes
+        return None
+    return orientation if 1 <= orientation <= 8 else None
 
-    prefix_len = 6 if exif_bytes.startswith(b"Exif\x00\x00") else 0
-    tiff = exif_bytes[prefix_len:]
-    if len(tiff) < 8:
-        return exif_bytes
 
-    if tiff[:2] == b"II":
-        endian = "<"
-    elif tiff[:2] == b"MM":
-        endian = ">"
-    else:
-        return exif_bytes
+def _xmp_bytes(value: object) -> bytes | None:
+    if isinstance(value, bytes):
+        return value
+    if isinstance(value, str):
+        return value.encode("utf-8")
+    return None
 
-    try:
-        ifd_offset = unpack(endian + "L", tiff[4:8])[0]
-        tag_count_offset = prefix_len + ifd_offset
-        tag_count = unpack(
-            endian + "H", exif_bytes[tag_count_offset : tag_count_offset + 2]
-        )[0]
-    except (IndexError, StructError, TypeError, ValueError):
-        return exif_bytes
 
-    for tag_n in range(tag_count):
-        entry_offset = tag_count_offset + 2 + 12 * tag_n
-        entry = exif_bytes[entry_offset : entry_offset + 12]
-        if len(entry) < 12:
-            return exif_bytes
+def _xmp_orientation_value(value: object) -> int | None:
+    xmp = _xmp_bytes(value)
+    if not xmp:
+        return None
+    content = xmp.rsplit(b"\x00", 1)[0]
+    decoded = None
+    for encoding in ("utf-8", "latin1"):
         try:
-            tag = unpack(endian + "H", entry[:2])[0]
-        except (StructError, TypeError, ValueError):
-            return exif_bytes
-        if tag != EXIF_ORIENTATION_TAG:
-            continue
+            decoded = content.decode(encoding)
+            break
+        except UnicodeDecodeError:
+            pass
+    if decoded is None:
+        return None
+    match = re.search(r'tiff:Orientation(="|>)([0-9])', decoded)
+    return _valid_orientation(match.group(2)) if match else None
 
-        value_offset = entry_offset + 8
-        value = pack(endian + "H", orientation)
-        return exif_bytes[:value_offset] + value + exif_bytes[value_offset + 2 :]
 
-    return exif_bytes
+def _strip_xmp_orientation(value: object) -> bytes | None:
+    xmp = _xmp_bytes(value)
+    if not xmp:
+        return None
+    content, separator, trailing = xmp.rpartition(b"\x00")
+    if not separator:
+        content = xmp
+        trailing = b""
+    decoded = None
+    for encoding in ("utf-8", "latin1"):
+        try:
+            decoded = content.decode(encoding)
+            break
+        except UnicodeDecodeError:
+            pass
+    if decoded is None:
+        return xmp
+    decoded = re.sub(r'\s*tiff:Orientation="([0-9])"', "", decoded)
+    decoded = re.sub(r"\s*<tiff:Orientation>([0-9])</tiff:Orientation>", "", decoded)
+    return decoded.encode("utf-8") + (separator + trailing if separator else b"")
+
+
+def _image_orientation(img: Image.Image) -> int | None:
+    orientation = _valid_orientation(img.getexif().get(EXIF_ORIENTATION_TAG))
+    if orientation is not None:
+        return orientation
+    return _xmp_orientation_value(img.info.get("xmp")) or _xmp_orientation_value(
+        img.info.get("XML:com.adobe.xmp")
+    )
+
+
+def image_has_orientation_tag(img: Image.Image) -> bool:
+    return (
+        EXIF_ORIENTATION_TAG in img.getexif()
+        or _xmp_orientation_value(img.info.get("xmp")) is not None
+        or _xmp_orientation_value(img.info.get("XML:com.adobe.xmp")) is not None
+    )
+
+
+def image_path_has_orientation_tag(path: Path | str) -> bool:
+    try:
+        with Image.open(path) as img:
+            return image_has_orientation_tag(img)
+    except (OSError, ValueError):
+        return False
+
+
+def image_needs_orientation_normalization(img: Image.Image) -> bool:
+    return _image_orientation(img) in ORIENTATION_TRANSPOSE_METHODS
+
+
+def image_path_needs_orientation_normalization(path: Path | str) -> bool:
+    try:
+        with Image.open(path) as img:
+            return image_needs_orientation_normalization(img)
+    except (OSError, ValueError):
+        return False
 
 
 def _exif_bytes_for_save(img: Image.Image) -> bytes | None:
-    exif = img.info.get("exif")
-    if isinstance(exif, Image.Exif):
-        exif_bytes = exif.tobytes()
-    elif isinstance(exif, bytes):
-        exif_bytes = exif
+    exif = img.getexif()
+    if not exif:
+        return None
+    if EXIF_ORIENTATION_TAG in exif:
+        del exif[EXIF_ORIENTATION_TAG]
+    return exif.tobytes() if exif else None
+
+
+def _info_without_orientation(img: Image.Image) -> dict[str, object]:
+    info = img.info.copy()
+    exif = _exif_bytes_for_save(img)
+    if exif:
+        info["exif"] = exif
     else:
-        image_exif = img.getexif()
-        exif_bytes = image_exif.tobytes() if image_exif else None
-    return _restore_exif_orientation(exif_bytes, img.info.get("original_orientation"))
+        info.pop("exif", None)
+    info.pop("original_orientation", None)
+    for key in ("xmp", "XML:com.adobe.xmp"):
+        xmp = _strip_xmp_orientation(info.get(key))
+        if xmp:
+            info[key] = xmp
+        else:
+            info.pop(key, None)
+    return info
 
 
-def _jpeg_save_kwargs(img: Image.Image, quality: int) -> dict[str, object]:
-    save_kwargs: dict[str, object] = {"format": "JPEG", "quality": quality}
+def apply_exif_orientation(img: Image.Image) -> Image.Image:
+    orientation = _image_orientation(img)
+    method = ORIENTATION_TRANSPOSE_METHODS.get(orientation)
+    if method is None:
+        return img
+    normalized = img.transpose(method) if method is not None else img.copy()
+    normalized.info = _info_without_orientation(img)
+    return normalized
+
+
+def _metadata_save_kwargs(img: Image.Image, quality: int) -> dict[str, object]:
+    save_kwargs: dict[str, object] = {"quality": quality}
     exif = _exif_bytes_for_save(img)
     if exif:
         save_kwargs["exif"] = exif
     for key in ("icc_profile", "xmp"):
-        value = img.info.get(key)
+        value = (
+            _strip_xmp_orientation(img.info.get(key))
+            if key == "xmp"
+            else img.info.get(key)
+        )
         if value:
             save_kwargs[key] = value
     return save_kwargs
+
+
+def _jpeg_save_kwargs(img: Image.Image, quality: int) -> dict[str, object]:
+    return {"format": "JPEG", **_metadata_save_kwargs(img, quality)}
 
 
 def _jpeg_compatible_image(img: Image.Image) -> Image.Image:
@@ -119,27 +198,28 @@ def _jpeg_compatible_image(img: Image.Image) -> Image.Image:
 
 
 def save_jpeg_with_metadata(img: Image.Image, dst: Path, quality: int = 95) -> None:
-    _jpeg_compatible_image(img).save(dst, **_jpeg_save_kwargs(img, quality))
+    normalized = apply_exif_orientation(img)
+    _jpeg_compatible_image(normalized).save(
+        dst, **_jpeg_save_kwargs(normalized, quality)
+    )
 
 
-def copy_to_clipboard(text: str) -> bool:
-    if os.environ.get("WAYLAND_DISPLAY"):
-        cmd = ["wl-copy"]
-    elif os.environ.get("DISPLAY"):
-        cmd = ["xclip", "-selection", "c"]
-    else:
-        print(
-            "Error: Unable to detect display server. Clipboard not updated.",
-            file=sys.stderr,
-        )
-        return False
+def save_image_with_metadata(img: Image.Image, dst: Path, quality: int = 95) -> None:
+    normalized = apply_exif_orientation(img)
+    normalized.save(dst, **_metadata_save_kwargs(normalized, quality))
 
-    try:
-        subprocess.run(cmd, input=text, text=True, check=True, start_new_session=True)
-    except (OSError, subprocess.CalledProcessError):
-        print("Error: Clipboard command failed.", file=sys.stderr)
-        return False
-    return True
+
+def _copy_with_sha1(src: Path, dst: Path) -> str:
+    """Copy a file and hash it in the same read pass."""
+    digest = hashlib.sha1()
+    buffer = bytearray(1024 * 1024)
+    view = memoryview(buffer)
+    with src.open("rb") as source, dst.open("wb") as destination:
+        while size := source.readinto(buffer):
+            chunk = view[:size]
+            digest.update(chunk)
+            destination.write(chunk)
+    return digest.hexdigest()
 
 
 def upload_photo(src_file, resize=None, clipboard=False, clipboard_format=None):
@@ -153,24 +233,45 @@ def upload_photo(src_file, resize=None, clipboard=False, clipboard_format=None):
     upload_src = thumb_path / upload_filename
     upload_ext = Path(upload_filename).suffix
 
+    needs_conversion = is_heif_path(src_path)
+    needs_orientation_normalization = (
+        not needs_conversion and image_path_needs_orientation_normalization(src_path)
+    )
+    sha1 = None
+
     if resize:
         with Image.open(src_path) as img:
+            # JPEG decoders can discard high-frequency DCT data while decoding
+            # when the requested result is much smaller than the source.
+            if img.format == "JPEG":
+                scale = min(resize / max(img.size), 1.0)
+                draft_size = tuple(max(1, round(side * scale)) for side in img.size)
+                img.draft(None, draft_size)
+            img = apply_exif_orientation(img)
             img.thumbnail((resize, resize), Image.Resampling.LANCZOS)
-            if is_heif_path(src_path) or upload_ext.lower() in {".jpg", ".jpeg"}:
+            if needs_conversion or upload_ext.lower() in JPEG_SUFFIXES:
                 save_jpeg_with_metadata(img, upload_src)
             else:
-                img.save(upload_src, quality=95)
-    elif is_heif_path(src_path):
+                save_image_with_metadata(img, upload_src)
+    elif needs_conversion:
         with Image.open(src_path) as img:
             save_jpeg_with_metadata(img, upload_src)
+    elif needs_orientation_normalization:
+        with Image.open(src_path) as img:
+            if upload_ext.lower() in JPEG_SUFFIXES:
+                save_jpeg_with_metadata(img, upload_src)
+            else:
+                save_image_with_metadata(img, upload_src)
     else:
-        shutil.copyfile(src_path, upload_src)
+        sha1 = _copy_with_sha1(src_path, upload_src)
 
-    gps_banned = remove_gps_if_banned(upload_src)
+    gps_removed = remove_gps_if_banned(upload_src)
 
-    # Calculate SHA1 checksum
-    with open(upload_src, "rb") as f:
-        sha1 = hashlib.sha1(f.read()).hexdigest()
+    # Transformed files, and files modified by GPS redaction, still need a pass
+    # over the final bytes. Plain copies were already hashed while being copied.
+    if sha1 is None or gps_removed:
+        with open(upload_src, "rb") as f:
+            sha1 = hashlib.file_digest(f, "sha1").hexdigest()
     dst_filename = f"{filename_no_ext}_{sha1[:16]}{upload_ext}"
     dst = f"{config.rclone_destination}/{dst_filename}"
 

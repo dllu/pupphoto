@@ -1,25 +1,35 @@
 #!/usr/bin/env python3
 
-import argparse
-import shutil
-
-from config import load_config
-from upload_photo import upload_photo, upload_temp_filename
+from clipboard_util import clear_clipboard
 
 
 def main() -> None:
+    # Clear stale content before argument parsing or importing the image stack.
+    if not clear_clipboard():
+        raise SystemExit(1)
+
+    import argparse
+
     parser = argparse.ArgumentParser(
         description="Upload a photo, copy blog markup to the clipboard, and mirror the processed file locally."
     )
     parser.add_argument("src_file")
     args = parser.parse_args()
 
-    config = load_config().upload
+    from upload_photo import upload_photo, upload_temp_filename
+
     full_size_link = upload_photo(
         args.src_file,
         clipboard=True,
         clipboard_format="![]({url})",
     )
+
+    # Everything below happens after upload_photo has populated the clipboard.
+    import shutil
+
+    from config import load_config
+
+    config = load_config().upload
     dst_filename = full_size_link.rsplit("/", 1)[-1]
     processed_path = config.thumb_dir / upload_temp_filename(args.src_file)
     if not processed_path.is_file():

@@ -3,7 +3,6 @@ from pathlib import Path
 from typing import Optional, Tuple
 
 import subprocess
-import re
 
 from config import load_config
 
@@ -31,50 +30,68 @@ def is_in_banned_area(lat: float, lon: float) -> bool:
     return False
 
 
+def _gps_metadata(image_path: Path | str) -> dict[str, str]:
+    path = str(image_path)
+    try:
+        output = subprocess.check_output(
+            ["exiv2", "-Pkyv", "-g", "Exif.GPSInfo", path],
+            text=True,
+            stderr=subprocess.DEVNULL,
+        )
+    except (OSError, subprocess.CalledProcessError):
+        return {}
+
+    metadata = {}
+    for line in output.splitlines():
+        parts = line.split(maxsplit=2)
+        if len(parts) == 3:
+            key, _value_type, value = parts
+            metadata[key] = value
+    return metadata
+
+
+def _rational(value: str) -> float:
+    numerator, separator, denominator = value.partition("/")
+    return float(numerator) / float(denominator) if separator else float(numerator)
+
+
+def _coordinate(value: str) -> float | None:
+    components = value.split()
+    if len(components) != 3:
+        return None
+    try:
+        degrees, minutes, seconds = map(_rational, components)
+    except (ValueError, ZeroDivisionError):
+        return None
+    return degrees + minutes / 60 + seconds / 3600
+
+
+def _lat_lon_from_metadata(
+    metadata: dict[str, str],
+) -> Optional[Tuple[float, float]]:
+    latitude = _coordinate(metadata.get("Exif.GPSInfo.GPSLatitude", ""))
+    longitude = _coordinate(metadata.get("Exif.GPSInfo.GPSLongitude", ""))
+    lat_ref = metadata.get("Exif.GPSInfo.GPSLatitudeRef", "").upper()
+    lon_ref = metadata.get("Exif.GPSInfo.GPSLongitudeRef", "").upper()
+    if (
+        latitude is None
+        or longitude is None
+        or lat_ref not in {"N", "S"}
+        or lon_ref not in {"E", "W"}
+    ):
+        return None
+    return (
+        -latitude if lat_ref == "S" else latitude,
+        -longitude if lon_ref == "W" else longitude,
+    )
+
+
 def lat_lon_from_metadata(image_path: Path | str) -> Optional[Tuple[float, float]]:
     """
     Extract latitude and longitude from image metadata using exiv2 CLI.
     Returns (lat, lon) in decimal degrees or None if not available.
     """
-    path = str(image_path)
-    try:
-        raw_lat = subprocess.check_output(
-            ["exiv2", "-g", "Exif.GPSInfo.GPSLatitude", "-Pv", path], text=True
-        ).strip()
-        raw_lon = subprocess.check_output(
-            ["exiv2", "-g", "Exif.GPSInfo.GPSLongitude", "-Pv", path], text=True
-        ).strip()
-        lat_ref = subprocess.check_output(
-            ["exiv2", "-g", "Exif.GPSInfo.GPSLatitudeRef", "-Pv", path], text=True
-        ).strip()
-        lon_ref = subprocess.check_output(
-            ["exiv2", "-g", "Exif.GPSInfo.GPSLongitudeRef", "-Pv", path], text=True
-        ).strip()
-    except subprocess.CalledProcessError:
-        return None
-
-    if not raw_lat or not raw_lon or not lat_ref or not lon_ref:
-        return None
-
-    nums_lat = re.findall(r"[-+]?\d*\.\d+|\d+", raw_lat)
-    nums_lon = re.findall(r"[-+]?\d*\.\d+|\d+", raw_lon)
-    if len(nums_lat) < 3 or len(nums_lon) < 3:
-        return None
-    try:
-        d_lat, m_lat, s_lat = map(float, nums_lat[:3])
-        d_lon, m_lon, s_lon = map(float, nums_lon[:3])
-    except ValueError:
-        return None
-
-    lat = d_lat + m_lat / 60 + s_lat / 3600
-    lon = d_lon + m_lon / 60 + s_lon / 3600
-
-    if lat_ref.upper() != "N":
-        lat = -lat
-    if lon_ref.upper() != "E":
-        lon = -lon
-
-    return (lat, lon)
+    return _lat_lon_from_metadata(_gps_metadata(image_path))
 
 
 # Function to remove GPS data if within banned area
@@ -84,33 +101,25 @@ def remove_gps_if_banned(image_path: Path | str) -> bool:
     Returns True if metadata was modified.
     """
     path = str(image_path)
-    coords = lat_lon_from_metadata(path)
+    metadata = _gps_metadata(path)
+    coords = _lat_lon_from_metadata(metadata)
     if coords is None:
         return False
     lat, lon = coords
 
     if is_in_banned_area(lat, lon):
-        try:
-            output = subprocess.check_output(
-                ["exiv2", "-g", "Exif.GPSInfo", "-pa", path], text=True
-            )
-        except subprocess.CalledProcessError:
+        tags_to_delete = [key for key in metadata if key.startswith("Exif.GPSInfo")]
+        if not tags_to_delete:
             return False
-
-        tags_to_delete = []
-        for line in output.splitlines():
-            parts = line.split()
-            if parts:
-                tag = parts[0]
-                if tag.startswith("Exif.GPSInfo"):
-                    tags_to_delete.append(tag)
-
+        cmd = ["exiv2"]
         for tag in tags_to_delete:
-            subprocess.run(
-                ["exiv2", "-M", f"del {tag}", path],
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-            )
+            cmd.extend(["-M", f"del {tag}"])
+        cmd.append(path)
+        subprocess.run(
+            cmd,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
         return True
 
     return False

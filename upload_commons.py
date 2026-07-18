@@ -27,11 +27,18 @@ from typing import Any
 import requests
 from flask import Flask, jsonify, request
 from openai import OpenAI
-from PIL import ExifTags, Image, ImageOps
+from PIL import ExifTags, Image
 
 from config import CommonsConfig, OpenAIConfig, load_config
 from gps import is_in_banned_area
-from upload_photo import is_heif_path, save_jpeg_with_metadata, upload_temp_filename
+from upload_photo import (
+    apply_exif_orientation,
+    image_path_needs_orientation_normalization,
+    is_heif_path,
+    save_image_with_metadata,
+    save_jpeg_with_metadata,
+    upload_temp_filename,
+)
 
 
 Image.MAX_IMAGE_PIXELS = None
@@ -274,7 +281,8 @@ def _supplement_metadata_with_exiv2(
 
 def _read_metadata(image_path: Path) -> PhotoMetadata:
     with Image.open(image_path) as img:
-        img = ImageOps.exif_transpose(img)
+        if not is_heif_path(image_path):
+            img = apply_exif_orientation(img)
         width, height = img.size
         exif = img.getexif()
 
@@ -358,7 +366,8 @@ def _read_metadata(image_path: Path) -> PhotoMetadata:
 
 def _downsize_image(image_path: Path, max_dimension: int) -> tuple[bytes, str]:
     with Image.open(image_path) as img:
-        img = ImageOps.exif_transpose(img)
+        if not is_heif_path(image_path):
+            img = apply_exif_orientation(img)
         img.thumbnail((max_dimension, max_dimension), Image.Resampling.LANCZOS)
         output = BytesIO()
         img.save(output, format="JPEG", quality=92)
@@ -393,8 +402,15 @@ def _upload_safe_image_path(
     image_path: Path, metadata: PhotoMetadata
 ) -> tuple[Path, tempfile.TemporaryDirectory[str] | None]:
     needs_conversion = is_heif_path(image_path)
+    needs_orientation_normalization = (
+        not needs_conversion and image_path_needs_orientation_normalization(image_path)
+    )
     needs_gps_scrub = not metadata.location_allowed
-    if not needs_conversion and not needs_gps_scrub:
+    if (
+        not needs_conversion
+        and not needs_orientation_normalization
+        and not needs_gps_scrub
+    ):
         return image_path, None
 
     temp_dir = tempfile.TemporaryDirectory(prefix="pupphoto-commons-")
@@ -406,6 +422,13 @@ def _upload_safe_image_path(
             save_jpeg_with_metadata(img, safe_path)
         print(
             f"HEIF input detected; using converted JPEG upload copy {safe_path}",
+            flush=True,
+        )
+    elif needs_orientation_normalization:
+        with Image.open(image_path) as img:
+            save_image_with_metadata(img, safe_path)
+        print(
+            f"EXIF orientation detected; using normalized upload copy {safe_path}",
             flush=True,
         )
     else:
@@ -1883,18 +1906,14 @@ def _html_page(state: dict[str, Any]) -> str:
       button.onclick = async () => {{
         const title = button.dataset.fileTitle;
         setBusy(`Overwriting ${{title}}...`);
-        const response = await fetch("/overwrite", {{
-          method: "POST",
-          headers: {{ "Content-Type": "application/json" }},
-          body: JSON.stringify({{ title }}),
-        }});
-        const data = await response.json();
-        if (!response.ok) {{
-          clearBusy(data.error || "Overwrite failed", true);
+        try {{
+          const data = await postJson("/overwrite", {{ title }}, "overwrite");
+          clearBusy("Overwrite complete. Redirecting...");
+          window.location.href = data.redirect_url;
+        }} catch (error) {{
+          clearBusy(error.message || "Overwrite failed", true);
           return;
         }}
-        clearBusy("Overwrite complete. Redirecting...");
-        window.location.href = data.redirect_url;
       }};
     }});
     function setBusy(message) {{
@@ -1907,6 +1926,49 @@ def _html_page(state: dict[str, Any]) -> str:
       status.classList.toggle("error", isError);
       status.textContent = message;
     }}
+    function serverUnavailableMessage(action) {{
+      return (
+        "The local upload server is no longer responding while trying to " +
+        action +
+        ". Restart upload_commons.py and reload this page to continue."
+      );
+    }}
+    async function postJson(path, payload, action) {{
+      let response;
+      try {{
+        response = await fetch(path, {{
+          method: "POST",
+          headers: {{ "Content-Type": "application/json" }},
+          body: JSON.stringify(payload),
+        }});
+      }} catch (error) {{
+        throw new Error(serverUnavailableMessage(action));
+      }}
+
+      let data;
+      try {{
+        data = await response.json();
+      }} catch (error) {{
+        if (!response.ok) {{
+          throw new Error(
+            action.charAt(0).toUpperCase() +
+              action.slice(1) +
+              " failed: HTTP " +
+              response.status
+          );
+        }}
+        throw new Error(
+          "The local upload server returned an invalid response while trying to " +
+            action +
+            "."
+        );
+      }}
+
+      if (!response.ok) {{
+        throw new Error(data.error || action.charAt(0).toUpperCase() + action.slice(1) + " failed");
+      }}
+      return data;
+    }}
     function populateReview(data) {{
       document.getElementById("review-hint").value = data.hint || "";
       document.getElementById("filename").value = data.filename;
@@ -1918,14 +1980,11 @@ def _html_page(state: dict[str, Any]) -> str:
     }}
     async function analyzeWithHint(hintValue) {{
       setBusy("Generating proposal...");
-      const response = await fetch("/analyze", {{
-        method: "POST",
-        headers: {{ "Content-Type": "application/json" }},
-        body: JSON.stringify({{ hint: hintValue }}),
-      }});
-      const data = await response.json();
-      if (!response.ok) {{
-        clearBusy(data.error || "Analysis failed", true);
+      let data;
+      try {{
+        data = await postJson("/analyze", {{ hint: hintValue }}, "generate a proposal");
+      }} catch (error) {{
+        clearBusy(error.message || "Analysis failed", true);
         return null;
       }}
       populateReview(data);
@@ -1950,18 +2009,14 @@ def _html_page(state: dict[str, Any]) -> str:
           .filter(Boolean),
         nominate_quality_image: document.getElementById("quality-image").checked,
       }};
-      const response = await fetch("/submit", {{
-        method: "POST",
-        headers: {{ "Content-Type": "application/json" }},
-        body: JSON.stringify(payload),
-      }});
-      const data = await response.json();
-      if (!response.ok) {{
-        clearBusy(data.error || "Upload failed", true);
+      try {{
+        const data = await postJson("/submit", payload, "upload");
+        clearBusy("Upload complete. Redirecting...");
+        window.location.href = data.redirect_url;
+      }} catch (error) {{
+        clearBusy(error.message || "Upload failed", true);
         return;
       }}
-      clearBusy("Upload complete. Redirecting...");
-      window.location.href = data.redirect_url;
     }};
   </script>
 </body>

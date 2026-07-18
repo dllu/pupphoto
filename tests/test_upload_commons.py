@@ -10,6 +10,7 @@ from upload_commons import (
     PhotoMetadata,
     _category_intersection_query,
     _count_quality_image_nominations,
+    _html_page,
     _insert_quality_image_nomination,
     _quality_image_description,
     _read_metadata,
@@ -59,7 +60,9 @@ class UploadSafeImagePathTest(unittest.TestCase):
         self.assertEqual(safe_path, image_path)
         self.assertIsNone(temp_dir)
 
-    def test_allowed_heif_uses_converted_jpeg_copy_with_metadata(self) -> None:
+    def test_allowed_heif_uses_converted_jpeg_copy_without_original_orientation(
+        self,
+    ) -> None:
         source_dir = self.enterContext(tempfile.TemporaryDirectory())
         image_path = Path(source_dir) / "photo.heic"
         icc_profile = _srgb_profile_bytes()
@@ -87,11 +90,37 @@ class UploadSafeImagePathTest(unittest.TestCase):
         with Image.open(safe_path) as converted:
             converted_exif = converted.getexif()
             self.assertEqual(converted.format, "JPEG")
+            self.assertEqual(converted.size, (20, 10))
             self.assertEqual(converted_exif.get(271), "Camera Make")
             self.assertEqual(converted_exif.get(272), "Camera Model")
-            self.assertEqual(converted_exif.get(274), 6)
+            self.assertIsNone(converted_exif.get(274))
             self.assertEqual(converted.info.get("icc_profile"), icc_profile)
             self.assertEqual(converted.info.get("xmp"), xmp)
+
+    def test_allowed_jpeg_with_orientation_uses_normalized_copy(self) -> None:
+        source_dir = self.enterContext(tempfile.TemporaryDirectory())
+        image_path = Path(source_dir) / "photo.jpg"
+        image = Image.new("RGB", (20, 10), "red")
+        exif = Image.Exif()
+        exif[271] = "Camera Make"
+        exif[272] = "Camera Model"
+        exif[274] = 6
+        image.save(image_path, exif=exif, quality=90)
+
+        with patch("builtins.print"):
+            safe_path, temp_dir = _upload_safe_image_path(image_path, _metadata(True))
+
+        self.assertIsNotNone(temp_dir)
+        self.addCleanup(temp_dir.cleanup)
+        self.assertNotEqual(safe_path, image_path)
+        self.assertEqual(safe_path.name, "photo.jpg")
+        with Image.open(safe_path) as normalized:
+            normalized_exif = normalized.getexif()
+            self.assertEqual(normalized.format, "JPEG")
+            self.assertEqual(normalized.size, (10, 20))
+            self.assertEqual(normalized_exif.get(271), "Camera Make")
+            self.assertEqual(normalized_exif.get(272), "Camera Model")
+            self.assertIsNone(normalized_exif.get(274))
 
     def test_banned_location_uses_verified_scrubbed_copy_real_tempdir(self) -> None:
         source_dir = self.enterContext(tempfile.TemporaryDirectory())
@@ -148,6 +177,18 @@ class UploadSafeImagePathTest(unittest.TestCase):
         scrubbed_metadata = _read_metadata(image_path)
         self.assertIsNone(scrubbed_metadata.latitude)
         self.assertIsNone(scrubbed_metadata.longitude)
+
+
+class HtmlPageTest(unittest.TestCase):
+    def test_post_actions_show_local_server_error_on_fetch_failure(self) -> None:
+        html = _html_page({"metadata": _metadata(True).to_model_dict()})
+
+        self.assertIn("serverUnavailableMessage", html)
+        self.assertIn("The local upload server is no longer responding", html)
+        self.assertIn('await postJson("/analyze"', html)
+        self.assertIn('await postJson("/submit"', html)
+        self.assertIn('await postJson("/overwrite"', html)
+        self.assertEqual(html.count("await fetch("), 1)
 
 
 class CategorySelectionTest(unittest.TestCase):

@@ -1,11 +1,18 @@
 #!/usr/bin/env python3
 
-import argparse
-
-from upload_photo import upload_photo
+from clipboard_util import clear_clipboard
 
 
 def main() -> None:
+    # Do this before argparse and the image stack are imported: even if argument
+    # parsing or image processing takes time, a paste cannot use a stale URL.
+    if not clear_clipboard():
+        raise SystemExit(1)
+
+    import argparse
+
+    from upload_photo import upload_photo
+
     parser = argparse.ArgumentParser(
         description="Upload a photo, copy its public URL to the clipboard, and print it."
     )
