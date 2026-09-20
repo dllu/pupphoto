@@ -2,16 +2,21 @@ from datetime import date, datetime, timezone
 from pathlib import Path
 import tempfile
 import unittest
-from unittest.mock import patch
+from types import SimpleNamespace
+from unittest.mock import MagicMock, patch
 
 from PIL import Image, ImageCms
 
 from upload_commons import (
+    CommonsApi,
     PhotoMetadata,
+    VisionClient,
+    build_description_wikitext,
     _category_intersection_query,
     _count_quality_image_nominations,
     _html_page,
     _insert_quality_image_nomination,
+    _numbered_filenames,
     _quality_image_description,
     _read_metadata,
     _refine_category_intersections,
@@ -20,6 +25,7 @@ from upload_commons import (
     _utc_date_label,
     _utc_signature,
     _upload_safe_image_path,
+    run_app,
 )
 
 
@@ -179,6 +185,200 @@ class UploadSafeImagePathTest(unittest.TestCase):
         self.assertIsNone(scrubbed_metadata.longitude)
 
 
+class CommonsChunkedUploadTest(unittest.TestCase):
+    def _image_path(self, contents: bytes) -> Path:
+        source_dir = self.enterContext(tempfile.TemporaryDirectory())
+        image_path = Path(source_dir) / "photo.jpg"
+        image_path.write_bytes(contents)
+        return image_path
+
+    def _api(self, responses: list[dict[str, object]]) -> CommonsApi:
+        api = CommonsApi(SimpleNamespace(api_url="https://commons.example/api.php"))
+        api.login = MagicMock()
+        api.csrf_token = MagicMock(return_value="csrf-token")
+        api.post_upload = MagicMock(side_effect=responses)
+        return api
+
+    def test_small_file_still_uses_one_direct_upload_request(self) -> None:
+        image_path = self._image_path(b"tiny")
+        api = self._api([{"upload": {"result": "Success"}}])
+
+        with (
+            patch.object(CommonsApi, "_CHUNKED_UPLOAD_THRESHOLD_BYTES", 5),
+            patch("builtins.print"),
+        ):
+            url = api.upload_file(
+                image_path=image_path,
+                filename="Example photo.jpg",
+                description_wikitext="Description text",
+                summary="Upload summary",
+            )
+
+        self.assertEqual(
+            url,
+            "https://commons.wikimedia.org/wiki/File:Example_photo.jpg",
+        )
+        api.post_upload.assert_called_once()
+        request = api.post_upload.call_args.kwargs
+        self.assertEqual(
+            request["params"],
+            {
+                "action": "upload",
+                "filename": "Example photo.jpg",
+                "comment": "Upload summary",
+                "text": "Description text",
+                "ignorewarnings": "0",
+                "token": "csrf-token",
+            },
+        )
+        self.assertEqual(request["files"]["file"][0], "Example photo.jpg")
+        self.assertNotIn("chunk", request["files"])
+
+    def test_large_file_stashes_ordered_chunks_then_commits_metadata(self) -> None:
+        image_path = self._image_path(b"abcdefghij")
+        api = self._api(
+            [
+                {
+                    "upload": {
+                        "result": "Continue",
+                        "offset": 4,
+                        "filekey": "stash-one.jpg",
+                    }
+                },
+                {
+                    "upload": {
+                        "result": "Continue",
+                        "offset": 8,
+                        "filekey": "stash-two.jpg",
+                    }
+                },
+                {
+                    "upload": {
+                        "result": "Success",
+                        "filekey": "stash-final.jpg",
+                    }
+                },
+                {"upload": {"result": "Success"}},
+            ]
+        )
+
+        with (
+            patch.object(CommonsApi, "_CHUNKED_UPLOAD_THRESHOLD_BYTES", 5),
+            patch.object(CommonsApi, "_UPLOAD_CHUNK_SIZE_BYTES", 4),
+            patch("builtins.print"),
+        ):
+            api.upload_file(
+                image_path=image_path,
+                filename="Example photo.jpg",
+                description_wikitext="Description text",
+                summary="Upload summary",
+            )
+
+        self.assertEqual(api.post_upload.call_count, 4)
+        requests = [call.kwargs for call in api.post_upload.call_args_list]
+        self.assertEqual(
+            [request["files"]["chunk"][1] for request in requests[:3]],
+            [b"abcd", b"efgh", b"ij"],
+        )
+        self.assertEqual(
+            [request["params"]["offset"] for request in requests[:3]],
+            [0, 4, 8],
+        )
+        self.assertNotIn("filekey", requests[0]["params"])
+        self.assertEqual(requests[1]["params"]["filekey"], "stash-one.jpg")
+        self.assertEqual(requests[2]["params"]["filekey"], "stash-two.jpg")
+        for request in requests[:3]:
+            self.assertEqual(request["params"]["filesize"], 10)
+            self.assertEqual(request["params"]["stash"], "1")
+            self.assertEqual(request["params"]["ignorewarnings"], "1")
+
+        self.assertNotIn("files", requests[3])
+        self.assertEqual(
+            requests[3]["params"],
+            {
+                "action": "upload",
+                "filename": "Example photo.jpg",
+                "comment": "Upload summary",
+                "text": "Description text",
+                "ignorewarnings": "0",
+                "token": "csrf-token",
+                "filekey": "stash-final.jpg",
+            },
+        )
+
+    def test_chunk_upload_refuses_an_unexpected_server_offset(self) -> None:
+        image_path = self._image_path(b"abcdefghij")
+        api = self._api(
+            [
+                {
+                    "upload": {
+                        "result": "Continue",
+                        "offset": 3,
+                        "filekey": "stash-one.jpg",
+                    }
+                }
+            ]
+        )
+
+        with (
+            patch.object(CommonsApi, "_CHUNKED_UPLOAD_THRESHOLD_BYTES", 5),
+            patch.object(CommonsApi, "_UPLOAD_CHUNK_SIZE_BYTES", 4),
+            patch("builtins.print"),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "unexpected offset"):
+                api.upload_file(
+                    image_path=image_path,
+                    filename="Example photo.jpg",
+                    description_wikitext="Description text",
+                    summary="Upload summary",
+                )
+
+        api.post_upload.assert_called_once()
+
+    def test_large_overwrite_commits_without_new_description_text(self) -> None:
+        image_path = self._image_path(b"abcde")
+        api = self._api(
+            [
+                {
+                    "upload": {
+                        "result": "Success",
+                        "filekey": "overwrite-stash.jpg",
+                    }
+                },
+                {"upload": {"result": "Success"}},
+            ]
+        )
+
+        with (
+            patch.object(CommonsApi, "_CHUNKED_UPLOAD_THRESHOLD_BYTES", 5),
+            patch.object(CommonsApi, "_UPLOAD_CHUNK_SIZE_BYTES", 5),
+            patch("builtins.print"),
+        ):
+            url = api.overwrite_file(
+                image_path=image_path,
+                title="File:Existing photo.jpg",
+                summary="Overwrite summary",
+            )
+
+        self.assertEqual(
+            url,
+            "https://commons.wikimedia.org/wiki/File:Existing_photo.jpg",
+        )
+        final_request = api.post_upload.call_args_list[1].kwargs
+        self.assertNotIn("files", final_request)
+        self.assertEqual(
+            final_request["params"],
+            {
+                "action": "upload",
+                "filename": "Existing photo.jpg",
+                "comment": "Overwrite summary",
+                "ignorewarnings": "1",
+                "token": "csrf-token",
+                "filekey": "overwrite-stash.jpg",
+            },
+        )
+
+
 class HtmlPageTest(unittest.TestCase):
     def test_post_actions_show_local_server_error_on_fetch_failure(self) -> None:
         html = _html_page({"metadata": _metadata(True).to_model_dict()})
@@ -189,6 +389,356 @@ class HtmlPageTest(unittest.TestCase):
         self.assertIn('await postJson("/submit"', html)
         self.assertIn('await postJson("/overwrite"', html)
         self.assertEqual(html.count("await fetch("), 1)
+
+    def test_group_page_renders_every_preview_and_batch_editor(self) -> None:
+        metadata = _metadata(True).to_model_dict()
+
+        html = _html_page(
+            {
+                "photos": [
+                    {
+                        "index": 0,
+                        "source_name": "first.jpg",
+                        "metadata": metadata,
+                        "sha1_matches": [],
+                    },
+                    {
+                        "index": 1,
+                        "source_name": "second.jpg",
+                        "metadata": metadata,
+                        "sha1_matches": [],
+                    },
+                ]
+            }
+        )
+
+        self.assertIn('src="/image/0"', html)
+        self.assertIn('src="/image/1"', html)
+        self.assertIn("const photoCount = 2", html)
+        self.assertIn("The topical categories were selected using the whole group", html)
+        self.assertIn("photos,", html)
+
+
+class GroupFilenameTest(unittest.TestCase):
+    def test_group_names_are_ordered_with_number_before_suffix(self) -> None:
+        filenames = _numbered_filenames(
+            "Sika deer in Nara Park",
+            "by Example",
+            [".JPG", ".jpeg", ".png"],
+        )
+
+        self.assertEqual(
+            filenames,
+            [
+                "Sika deer in Nara Park 01 by Example.jpg",
+                "Sika deer in Nara Park 02 by Example.jpeg",
+                "Sika deer in Nara Park 03 by Example.png",
+            ],
+        )
+
+    def test_single_photo_name_remains_unnumbered(self) -> None:
+        self.assertEqual(
+            _numbered_filenames("Sika deer", "by Example", [".JPG"]),
+            ["Sika deer by Example.jpg"],
+        )
+
+
+class BatchDescriptionTest(unittest.TestCase):
+    def test_description_places_ordered_batch_gallery_after_information(self) -> None:
+        description = build_description_wikitext(
+            caption="Front view of a sika deer in Nara Park.",
+            metadata=_metadata(True),
+            author="Example",
+            license_wikitext="{{self|cc-by-sa-4.0}}",
+            categories=["Deer in Nara"],
+            batch_filenames=[
+                "Sika deer 01 by Example.jpg",
+                "Sika deer 02 by Example.jpg",
+            ],
+        )
+
+        gallery_start = description.index('<gallery mode="packed"')
+        self.assertIn("}}\n<gallery", description)
+        self.assertLess(gallery_start, description.index("{{Location|"))
+        self.assertLess(gallery_start, description.index("=={{int:license-header}}=="))
+        self.assertLess(
+            description.index("File:Sika deer 01 by Example.jpg"),
+            description.index("File:Sika deer 02 by Example.jpg"),
+        )
+
+    def test_single_photo_description_does_not_add_gallery(self) -> None:
+        description = build_description_wikitext(
+            caption="A sika deer in Nara Park.",
+            metadata=_metadata(True),
+            author="Example",
+            license_wikitext="{{self|cc-by-sa-4.0}}",
+            categories=["Deer in Nara"],
+            batch_filenames=["Sika deer by Example.jpg"],
+        )
+
+        self.assertNotIn("<gallery", description)
+
+
+class GroupVisionRequestTest(unittest.TestCase):
+    def test_proposal_sends_all_photos_in_order_with_exact_length_schema(self) -> None:
+        client = VisionClient.__new__(VisionClient)
+        client.config = SimpleNamespace(vision_model="test-model", image_detail="high")
+        client.client = MagicMock()
+        client.client.responses.create.return_value = SimpleNamespace(
+            output_text=(
+                '{"group_filename_stem":"Sika deer in Nara Park",'
+                '"photos":['
+                '{"caption_en":"First view.","visual_summary":"Front view."},'
+                '{"caption_en":"Second view.","visual_summary":"Side view."}],'
+                '"keywords":["sika deer"],"search_queries":["Deer in Nara"],'
+                '"relationship_queries":[],"group_summary":"Two related views.",'
+                '"research_summary":""}'
+            )
+        )
+
+        with patch("builtins.print"):
+            result = client.propose_group_metadata(
+                ["data:image/jpeg;base64,first", "data:image/jpeg;base64,second"],
+                [_metadata(True), _metadata(True)],
+                "by Example",
+                "Nara Park",
+                ["first.jpg", "second.jpg"],
+            )
+
+        self.assertEqual(len(result["photos"]), 2)
+        request_kwargs = client.client.responses.create.call_args.kwargs
+        user_content = request_kwargs["input"][1]["content"]
+        image_urls = [
+            item["image_url"]
+            for item in user_content
+            if item["type"] == "input_image"
+        ]
+        self.assertEqual(
+            image_urls,
+            ["data:image/jpeg;base64,first", "data:image/jpeg;base64,second"],
+        )
+        schema = request_kwargs["text"]["format"]["schema"]
+        self.assertEqual(schema["properties"]["photos"]["minItems"], 2)
+        self.assertEqual(schema["properties"]["photos"]["maxItems"], 2)
+
+    def test_category_selection_considers_all_photos_together(self) -> None:
+        client = VisionClient.__new__(VisionClient)
+        client.config = SimpleNamespace(vision_model="test-model", image_detail="high")
+        client.client = MagicMock()
+        client.client.responses.create.return_value = SimpleNamespace(
+            output_text=(
+                '{"photo_categories":['
+                '["Category:Deer in Nara"],["Category:Deer in Nara"]],'
+                '"reasoning_summary":"Shared subject and place."}'
+            )
+        )
+
+        with patch("builtins.print"):
+            result = client.choose_group_categories(
+                image_data_urls=[
+                    "data:image/jpeg;base64,first",
+                    "data:image/jpeg;base64,second",
+                ],
+                metadatas=[_metadata(True), _metadata(True)],
+                proposed_photos=[
+                    {
+                        "caption_en": "First view.",
+                        "visual_summary": "Front view.",
+                    },
+                    {
+                        "caption_en": "Second view.",
+                        "visual_summary": "Side view.",
+                    },
+                ],
+                group_summary="Two related views.",
+                research_summary="",
+                category_graph={
+                    "nodes": {
+                        "Category:Deer in Nara": {
+                            "file_count": 10,
+                            "subcategory_count": 0,
+                            "parents": [],
+                            "children": [],
+                        }
+                    }
+                },
+                user_hint="Nara Park",
+            )
+
+        self.assertEqual(
+            result["photo_categories"],
+            [["Category:Deer in Nara"], ["Category:Deer in Nara"]],
+        )
+        request_kwargs = client.client.responses.create.call_args.kwargs
+        self.assertEqual(
+            sum(
+                item["type"] == "input_image"
+                for item in request_kwargs["input"][1]["content"]
+            ),
+            2,
+        )
+        schema = request_kwargs["text"]["format"]["schema"]
+        self.assertEqual(schema["properties"]["photo_categories"]["minItems"], 2)
+
+
+class BatchUploadFlowTest(unittest.TestCase):
+    class FakeVisionClient:
+        def __init__(self, _config: object) -> None:
+            pass
+
+        def propose_group_metadata(self, **kwargs: object) -> dict[str, object]:
+            image_data_urls = kwargs["image_data_urls"]
+            assert isinstance(image_data_urls, list)
+            if len(image_data_urls) != 2:
+                raise AssertionError("Expected both photos in the proposal request")
+            return {
+                "group_filename_stem": "Sika deer in Nara Park",
+                "photos": [
+                    {
+                        "caption_en": "Front view of a sika deer in Nara Park.",
+                        "visual_summary": "Front view of the deer.",
+                    },
+                    {
+                        "caption_en": "Side view of a sika deer in Nara Park.",
+                        "visual_summary": "Side view of the deer.",
+                    },
+                ],
+                "keywords": ["sika deer", "Nara Park"],
+                "search_queries": ["Deer in Nara"],
+                "relationship_queries": [],
+                "group_summary": "Two views of the same subject and place.",
+                "research_summary": "",
+            }
+
+        def choose_group_categories(self, **kwargs: object) -> dict[str, object]:
+            image_data_urls = kwargs["image_data_urls"]
+            assert isinstance(image_data_urls, list)
+            if len(image_data_urls) != 2:
+                raise AssertionError("Expected both photos in the category request")
+            return {
+                "photo_categories": [
+                    ["Category:Deer in Nara"],
+                    ["Category:Deer in Nara"],
+                ],
+                "reasoning_summary": "The category applies to the whole group.",
+            }
+
+    class FakeCommonsApi:
+        last_instance: "BatchUploadFlowTest.FakeCommonsApi | None" = None
+
+        def __init__(self, _config: object) -> None:
+            self.uploads: list[dict[str, object]] = []
+            self.__class__.last_instance = self
+
+        def login(self) -> None:
+            pass
+
+        def quality_image_nomination_count(
+            self, _username: str, _nomination_date: date
+        ) -> int:
+            return 0
+
+        def existing_category_titles(self, _titles: list[str]) -> list[str]:
+            return []
+
+        def upload_file(self, **kwargs: object) -> str:
+            self.uploads.append(kwargs)
+            filename = str(kwargs["filename"])
+            return f"https://commons.wikimedia.org/wiki/File:{filename}"
+
+    def test_review_and_submit_uploads_the_ordered_group(self) -> None:
+        source_dir = self.enterContext(tempfile.TemporaryDirectory())
+        first_path = Path(source_dir) / "first.jpg"
+        second_path = Path(source_dir) / "second.jpg"
+        Image.new("RGB", (12, 10), "red").save(first_path)
+        Image.new("RGB", (12, 10), "blue").save(second_path)
+        commons_config = SimpleNamespace(
+            username="Example@Uploader",
+            password="secret",
+            author="Example",
+            license_wikitext="{{self|cc-by-sa-4.0}}",
+            filename_suffix="by Example",
+            search_limit_per_query=8,
+            max_candidate_categories=40,
+            max_parent_depth=3,
+            ui_host="127.0.0.1",
+        )
+        openai_config = SimpleNamespace(
+            api_key="test-key",
+            vision_model="test-model",
+            image_detail="high",
+            downsized_max_dimension=1600,
+        )
+        app_config = SimpleNamespace(
+            commons=commons_config,
+            openai=openai_config,
+        )
+        category_graph = {
+            "nodes": {
+                "Category:Deer in Nara": {
+                    "file_count": 10,
+                    "subcategory_count": 0,
+                    "parents": [],
+                    "children": [],
+                }
+            }
+        }
+        captured: dict[str, object] = {}
+
+        def capture_run(app: object, **_kwargs: object) -> None:
+            captured["app"] = app
+
+        with (
+            patch("upload_commons.load_config", return_value=app_config),
+            patch("upload_commons.VisionClient", self.FakeVisionClient),
+            patch("upload_commons.CommonsApi", self.FakeCommonsApi),
+            patch("upload_commons._build_category_graph", return_value=category_graph),
+            patch("upload_commons._free_port", return_value=54321),
+            patch("upload_commons.Flask.run", new=capture_run),
+            patch("upload_commons.threading.Thread"),
+            patch("upload_commons._schedule_exit") as schedule_exit,
+            patch("builtins.print"),
+        ):
+            run_app([first_path, second_path])
+            app = captured["app"]
+            client = app.test_client()
+
+            analyze_response = client.post("/analyze", json={"hint": "Nara Park"})
+            self.assertEqual(analyze_response.status_code, 200)
+            review = analyze_response.get_json()
+            self.assertEqual(
+                [photo["filename"] for photo in review["photos"]],
+                [
+                    "Sika deer in Nara Park 01 by Example.jpg",
+                    "Sika deer in Nara Park 02 by Example.jpg",
+                ],
+            )
+
+            submit_response = client.post(
+                "/submit",
+                json={"photos": review["photos"]},
+            )
+
+        self.assertEqual(submit_response.status_code, 200)
+        upload_result = submit_response.get_json()
+        self.assertEqual(len(upload_result["uploaded_files"]), 2)
+        api = self.FakeCommonsApi.last_instance
+        self.assertIsNotNone(api)
+        self.assertEqual(
+            [upload["filename"] for upload in api.uploads],
+            [
+                "Sika deer in Nara Park 01 by Example.jpg",
+                "Sika deer in Nara Park 02 by Example.jpg",
+            ],
+        )
+        self.assertIn("Front view", api.uploads[0]["description_wikitext"])
+        self.assertIn("Side view", api.uploads[1]["description_wikitext"])
+        self.assertIn("[[Category:Deer in Nara]]", api.uploads[0]["description_wikitext"])
+        for upload in api.uploads:
+            description = upload["description_wikitext"]
+            self.assertIn("File:Sika deer in Nara Park 01 by Example.jpg", description)
+            self.assertIn("File:Sika deer in Nara Park 02 by Example.jpg", description)
+        schedule_exit.assert_called_once_with()
 
 
 class CategorySelectionTest(unittest.TestCase):

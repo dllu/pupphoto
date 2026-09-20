@@ -7,8 +7,10 @@ import json
 import re
 import time
 from dataclasses import dataclass
+from html.parser import HTMLParser
 from pathlib import Path
 from typing import Any
+from urllib.parse import parse_qs, unquote, urlsplit
 
 import requests
 
@@ -52,12 +54,12 @@ class PromotionSpec:
 class FileCategoryStatus:
     title: str
     categories: frozenset[str]
-    original_uploader: str | None
+    artist: str | None
 
 
 _PROMOTION_TEMPLATE_PATTERN = re.compile(
     r"\{\{\s*(?:Template\s*:\s*)?"
-    r"(QICpromoted|FPpromotion|VICpromoted)\s*\|\s*"
+    r"(QICpromoted|FPpromotion|FPpromotedUploader|VICpromoted)\s*\|\s*"
     r"(?:1\s*=\s*)?([^|{}\n]+)",
     re.IGNORECASE,
 )
@@ -80,8 +82,58 @@ def _extract_promoted_files(wikitext: str) -> list[tuple[str, str]]:
     for match in _PROMOTION_TEMPLATE_PATTERN.finditer(wikitext):
         title = _normalize_promoted_file_title(match.group(2))
         if title:
-            promotions.append((match.group(1).casefold(), title))
+            promotion_key = match.group(1).casefold()
+            if promotion_key == "fppromoteduploader":
+                promotion_key = "fppromotion"
+            promotions.append((promotion_key, title))
     return promotions
+
+
+class _ArtistParser(HTMLParser):
+    def __init__(self) -> None:
+        super().__init__()
+        self.text: list[str] = []
+        self.user_pages: set[str] = set()
+        self.has_links = False
+
+    def handle_data(self, data: str) -> None:
+        self.text.append(data)
+
+    def handle_starttag(
+        self, tag: str, attrs: list[tuple[str, str | None]]
+    ) -> None:
+        if tag != "a":
+            return
+        self.has_links = True
+        href = dict(attrs).get("href")
+        if not href:
+            return
+        url = urlsplit(href)
+        if url.scheme not in {"", "http", "https"} or url.netloc.casefold() not in {
+            "",
+            "commons.wikimedia.org",
+        }:
+            return
+        if url.path.startswith("/wiki/"):
+            title = unquote(url.path[len("/wiki/") :])
+        elif url.path == "/w/index.php":
+            title = parse_qs(url.query).get("title", [""])[0]
+        else:
+            return
+        if title.casefold().startswith("user:"):
+            self.user_pages.add(_title_key(title))
+
+
+def _is_authored_by(artist: str | None, username: str) -> bool:
+    """Require attribution to the account, independent of uploader or nominator."""
+    if not artist:
+        return False
+    parser = _ArtistParser()
+    parser.feed(artist)
+    parser.close()
+    if parser.has_links:
+        return _title_key(f"User:{username}") in parser.user_pages
+    return _title_key("".join(parser.text)) == _title_key(username)
 
 
 class CommonsApi:
@@ -247,8 +299,9 @@ class CommonsApi:
                 prop="categories|imageinfo",
                 clcategories="|".join(category_titles),
                 cllimit="max",
-                iiprop="user",
-                iilimit="max",
+                iiprop="extmetadata",
+                iiextmetadatafilter="Artist",
+                iilimit="1",
             )
 
             aliases: dict[str, str] = {}
@@ -266,8 +319,11 @@ class CommonsApi:
                     categories=frozenset(
                         category["title"] for category in page.get("categories", [])
                     ),
-                    original_uploader=(
-                        page["imageinfo"][-1].get("user")
+                    artist=(
+                        page["imageinfo"][0]
+                        .get("extmetadata", {})
+                        .get("Artist", {})
+                        .get("value")
                         if page.get("imageinfo")
                         else None
                     ),
@@ -384,16 +440,14 @@ def run(config_path: Path | None = None) -> None:
     statuses = commons_api.file_category_statuses(candidate_titles, category_names)
     missing_by_file: dict[str, list[str]] = {}
     skipped_missing = 0
-    skipped_other_uploaders = 0
+    skipped_unverified_authors = 0
     for candidate_title, promotion_keys in promotion_keys_by_title.items():
         status = statuses.get(candidate_title)
         if status is None:
             skipped_missing += 1
             continue
-        if status.original_uploader is None or (
-            status.original_uploader.casefold() != username.casefold()
-        ):
-            skipped_other_uploaders += 1
+        if not _is_authored_by(status.artist, username):
+            skipped_unverified_authors += 1
             continue
         existing_category_keys = {_title_key(name) for name in status.categories}
         missing_categories = [
@@ -423,10 +477,10 @@ def run(config_path: Path | None = None) -> None:
             else ""
         )
         + (
-            f" Skipped {skipped_other_uploaders} file"
-            + ("s" if skipped_other_uploaders != 1 else "")
-            + " uploaded by other users."
-            if skipped_other_uploaders
+            f" Skipped {skipped_unverified_authors} file"
+            + ("s" if skipped_unverified_authors != 1 else "")
+            + f" without verified authorship by {username}."
+            if skipped_unverified_authors
             else ""
         ),
         flush=True,

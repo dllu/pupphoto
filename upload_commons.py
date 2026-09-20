@@ -103,6 +103,18 @@ class CategoryNode:
     subcategory_count: int
 
 
+@dataclass
+class PreparedPhoto:
+    source_path: Path
+    upload_path: Path
+    upload_temp_dir: tempfile.TemporaryDirectory[str] | None
+    metadata: PhotoMetadata
+    preview_bytes: bytes
+    preview_mime_type: str
+    image_data_url: str
+    sha1_matches: list[dict[str, str]]
+
+
 def _get_exif_value(exif: dict[int, Any], tag_name: str) -> Any:
     for tag, value in exif.items():
         if EXIF_TAGS.get(tag) == tag_name:
@@ -583,6 +595,8 @@ class CommonsApi:
     _MAX_RETRY_DELAY_SECONDS = 30.0
     _MAX_CHILD_CATEGORY_LOOKUPS = 12
     _RETRYABLE_STATUS_CODES = {429, 500, 502, 503, 504}
+    _CHUNKED_UPLOAD_THRESHOLD_BYTES = 95 * 1024 * 1024
+    _UPLOAD_CHUNK_SIZE_BYTES = 20 * 1024 * 1024
 
     def __init__(self, config: CommonsConfig):
         self.config = config
@@ -685,7 +699,9 @@ class CommonsApi:
         )
 
     def post_upload(
-        self, params: dict[str, Any], files: dict[str, Any]
+        self,
+        params: dict[str, Any],
+        files: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         return self._request_json(
             "POST",
@@ -947,6 +963,134 @@ class CommonsApi:
                 }
         return result
 
+    def _stash_file_in_chunks(
+        self,
+        image_path: Path,
+        filename: str,
+        token: str,
+    ) -> str:
+        filesize = image_path.stat().st_size
+        chunk_count = (
+            filesize + self._UPLOAD_CHUNK_SIZE_BYTES - 1
+        ) // self._UPLOAD_CHUNK_SIZE_BYTES
+        mime_type = mimetypes.guess_type(filename)[0] or "application/octet-stream"
+        print(
+            f"Using chunked upload for {filesize / (1024 * 1024):.1f} MiB file "
+            f"({chunk_count} chunks)...",
+            flush=True,
+        )
+
+        offset = 0
+        filekey: str | None = None
+        last_result: str | None = None
+        with image_path.open("rb") as source:
+            for chunk_number in range(1, chunk_count + 1):
+                source.seek(offset)
+                chunk = source.read(self._UPLOAD_CHUNK_SIZE_BYTES)
+                if not chunk:
+                    raise RuntimeError(
+                        f"Could not read Commons upload chunk at offset {offset}"
+                    )
+
+                params: dict[str, Any] = {
+                    "action": "upload",
+                    "filename": filename,
+                    "filesize": filesize,
+                    "offset": offset,
+                    "stash": "1",
+                    "ignorewarnings": "1",
+                    "token": token,
+                }
+                if filekey is not None:
+                    params["filekey"] = filekey
+
+                data = self.post_upload(
+                    params=params,
+                    files={"chunk": (filename, chunk, mime_type)},
+                )
+                upload = data.get("upload", {})
+                last_result = upload.get("result")
+                returned_filekey = upload.get("filekey")
+                if not isinstance(returned_filekey, str) or not returned_filekey:
+                    raise RuntimeError(
+                        "Commons chunk upload did not return a file key: "
+                        f"{upload}"
+                    )
+                filekey = returned_filekey
+
+                expected_offset = offset + len(chunk)
+                if last_result == "Continue":
+                    returned_offset = upload.get("offset")
+                    if returned_offset != expected_offset:
+                        raise RuntimeError(
+                            "Commons chunk upload returned an unexpected offset: "
+                            f"expected {expected_offset}, got {returned_offset}"
+                        )
+                    offset = returned_offset
+                elif last_result == "Success":
+                    if expected_offset != filesize:
+                        raise RuntimeError(
+                            "Commons reported a completed chunk upload before the "
+                            f"whole file was sent ({expected_offset} of {filesize} bytes)"
+                        )
+                    offset = expected_offset
+                else:
+                    raise RuntimeError(
+                        f"Commons chunk upload failed at offset {offset}: {upload}"
+                    )
+
+                print(
+                    f"Uploaded chunk {chunk_number}/{chunk_count} "
+                    f"({offset / filesize:.0%}).",
+                    flush=True,
+                )
+
+        if last_result != "Success" or offset != filesize or filekey is None:
+            raise RuntimeError(
+                "Commons chunk upload ended before the complete file was stashed"
+            )
+        return filekey
+
+    def _upload_file_contents(
+        self,
+        image_path: Path,
+        filename: str,
+        token: str,
+        comment: str,
+        ignorewarnings: str,
+        text: str | None = None,
+    ) -> dict[str, Any]:
+        params: dict[str, Any] = {
+            "action": "upload",
+            "filename": filename,
+            "comment": comment,
+            "ignorewarnings": ignorewarnings,
+            "token": token,
+        }
+        if text is not None:
+            params["text"] = text
+
+        if image_path.stat().st_size >= self._CHUNKED_UPLOAD_THRESHOLD_BYTES:
+            params["filekey"] = self._stash_file_in_chunks(
+                image_path=image_path,
+                filename=filename,
+                token=token,
+            )
+            return self.post_upload(params=params)
+
+        with image_path.open("rb") as source:
+            return self.post_upload(
+                params=params,
+                files={
+                    "file": (
+                        filename,
+                        source,
+                        mimetypes.guess_type(filename)[0]
+                        or "application/octet-stream",
+                    )
+                },
+            )
+
     def upload_file(
         self,
         image_path: Path,
@@ -957,24 +1101,14 @@ class CommonsApi:
         self.login()
         token = self.csrf_token()
         print(f"Uploading file to Commons as {filename}...", flush=True)
-        with image_path.open("rb") as f:
-            data = self.post_upload(
-                params={
-                    "action": "upload",
-                    "filename": filename,
-                    "comment": summary,
-                    "text": description_wikitext,
-                    "ignorewarnings": "0",
-                    "token": token,
-                },
-                files={
-                    "file": (
-                        filename,
-                        f,
-                        mimetypes.guess_type(filename)[0] or "application/octet-stream",
-                    )
-                },
-            )
+        data = self._upload_file_contents(
+            image_path=image_path,
+            filename=filename,
+            token=token,
+            comment=summary,
+            text=description_wikitext,
+            ignorewarnings="0",
+        )
         upload = data["upload"]
         if upload["result"] != "Success":
             raise RuntimeError(f"Commons upload failed: {upload}")
@@ -990,23 +1124,13 @@ class CommonsApi:
         token = self.csrf_token()
         filename = title.removeprefix("File:")
         print(f"Overwriting Commons file {title}...", flush=True)
-        with image_path.open("rb") as f:
-            data = self.post_upload(
-                params={
-                    "action": "upload",
-                    "filename": filename,
-                    "comment": summary,
-                    "ignorewarnings": "1",
-                    "token": token,
-                },
-                files={
-                    "file": (
-                        filename,
-                        f,
-                        mimetypes.guess_type(filename)[0] or "application/octet-stream",
-                    )
-                },
-            )
+        data = self._upload_file_contents(
+            image_path=image_path,
+            filename=filename,
+            token=token,
+            comment=summary,
+            ignorewarnings="1",
+        )
         upload = data["upload"]
         if upload["result"] != "Success":
             raise RuntimeError(f"Commons overwrite failed: {upload}")
@@ -1018,79 +1142,146 @@ class VisionClient:
         self.config = config
         self.client = OpenAI(api_key=config.api_key)
 
-    def propose_metadata(
+    def propose_group_metadata(
         self,
-        image_data_url: str,
-        metadata: PhotoMetadata,
+        image_data_urls: list[str],
+        metadatas: list[PhotoMetadata],
         suffix_hint: str,
         user_hint: str,
+        source_names: list[str] | None = None,
     ) -> dict[str, Any]:
+        photo_count = len(image_data_urls)
+        if photo_count == 0 or len(metadatas) != photo_count:
+            raise ValueError("Image data and metadata must describe the same photo group")
+        if source_names is not None and len(source_names) != photo_count:
+            raise ValueError("Source names must describe the same photo group")
+
         print(
-            "Requesting filename, caption, and category search hints from OpenAI...",
+            "Requesting a shared filename, consistent captions, and category search "
+            "hints from OpenAI...",
             flush=True,
         )
+        photo_schema = {
+            "type": "object",
+            "properties": {
+                "caption_en": {"type": "string"},
+                "visual_summary": {"type": "string"},
+            },
+            "required": ["caption_en", "visual_summary"],
+            "additionalProperties": False,
+        }
         schema = {
             "type": "object",
             "properties": {
-                "filename_stem": {"type": "string"},
-                "caption_en": {"type": "string"},
+                "group_filename_stem": {"type": "string"},
+                "photos": {
+                    "type": "array",
+                    "items": photo_schema,
+                    "minItems": photo_count,
+                    "maxItems": photo_count,
+                },
                 "keywords": {"type": "array", "items": {"type": "string"}},
                 "search_queries": {"type": "array", "items": {"type": "string"}},
                 "relationship_queries": {
                     "type": "array",
                     "items": {"type": "string"},
                 },
-                "visual_summary": {"type": "string"},
+                "group_summary": {"type": "string"},
                 "research_summary": {"type": "string"},
             },
             "required": [
-                "filename_stem",
-                "caption_en",
+                "group_filename_stem",
+                "photos",
                 "keywords",
                 "search_queries",
                 "relationship_queries",
-                "visual_summary",
+                "group_summary",
                 "research_summary",
             ],
             "additionalProperties": False,
         }
         instructions = (
-            "You are preparing a Wikimedia Commons upload. "
-            "Return JSON only. "
-            "Use web search when the image or hint may involve a recently released product, vehicle, train, station, event, public artwork, building, route, operator, or other named subject whose identity or terminology may have changed after model training. "
-            "Search sparingly and only enough to identify current factual names and common terms; do not search for generic visual descriptors. "
-            "Write a concise English filename stem using plain ASCII words separated by spaces, "
-            "without file extension and without the configured suffix. "
-            "Write a concise, factual, neutral, encyclopedic English caption. "
-            "Treat the optional user hint as high-priority factual context when it provides names, locations, dates, events, or the shooting viewpoint. "
-            "Silently correct likely misspellings in the user hint when generating the caption, keywords, and category search queries. "
-            "Before generating metadata, actively inspect the image for discriminating clues such as visible text, model or serial numbers, logos, badges, signage, inscriptions, distinctive physical features, and location markers. "
-            "Use those clues to identify depicted subjects as specifically as reasonably possible. "
-            "When a clue could resolve a more precise identity, verify it with web search rather than stopping at a generic object class or guessing. "
-            "Include each verified specific identity in the caption, keywords, and category search queries when relevant. "
-            "Also identify visually central relationships, combinations, or states involving those subjects, such as an adult animal with its juvenile, a person performing an activity, a vehicle at a named place, or an object displaying or using another object. "
-            "Put no more than two high-value Commons category lookup phrases for such combinations in relationship_queries, using an empty array when none applies. "
-            "Phrase relationship queries like plausible Commons category titles, include the specific species, model, person, place, or other identity needed to disambiguate them, and do not invent a relationship that is not visually supported. "
-            "Generate search queries for Wikimedia Commons categories that emphasize specific depicted subjects, "
-            "locations, events, operators, object classes, and year if relevant. "
-            "Generate no more than 8 category lookup queries in total across search_queries and relationship_queries, and make each one specific enough to plausibly match a Commons category title. "
-            "Within that limit, prioritize one standalone query containing only the concise canonical name of each central specifically identified subject. "
-            "Do not add an expanded operator or organization name, serial or vehicle number, location, date, or descriptive terms to that standalone query; put useful combinations in separate additional queries. "
-            'For example, use both "<canonical subject name>" and, when relevant, "<canonical subject name> at <location>" rather than using only the combined query. '
-            "Category search queries are for Commons category lookup, not broad web search; every query should contain a named subject, named place, model name, operator, route, event, year, or other concrete identifying context. "
-            "Do not output bare visual, compositional, or object-class descriptors as category search queries; if a viewpoint, lighting condition, part/detail, or object class is categorically useful, combine it with the specific named subject or place. "
-            "When the image is described as a subject seen from a named place or viewpoint, include highly specific queries for that relationship, such as "
-            '"<subject> from <viewpoint>", "views of <subject> from <viewpoint>", and other exact proper-name combinations that could match an existing Commons category. '
-            "Prefer exact proper names over generic descriptions in search queries. "
-            "When the time of day or lighting is visually clear and categorically useful, include search queries for that too, such as dusk, sunset, dawn, night, or blue hour, combined with the location if appropriate. "
-            "Do not include photographic equipment categories in the search queries; those are handled separately. "
-            "In research_summary, briefly state any web-searched current facts that affected the filename, caption, or category queries; otherwise return an empty string. "
-            "Avoid speculation and avoid promotional language. "
-            f"The upload workflow will append this suffix later if non-empty: {suffix_hint!r}."
+            f"You are preparing an ordered group of {photo_count} highly related "
+            "photo(s) for Wikimedia Commons. Return JSON only. Analyze every photo "
+            "together before describing any one of them. "
+            "Use web search when the photos or hint may involve a recently released "
+            "product, vehicle, train, station, event, public artwork, building, route, "
+            "operator, or another named subject whose identity or terminology may have "
+            "changed after model training. Search sparingly and only enough to identify "
+            "current factual names and common terms. "
+            "Write one concise English group_filename_stem using plain ASCII words "
+            "separated by spaces, without a number, file extension, or configured suffix. "
+            "It must accurately describe every photo; the upload workflow will append "
+            "ordered numbers. "
+            "Return exactly one photos entry per input photo in the original order. Write "
+            "a concise, factual, neutral, encyclopedic English caption for each. Keep the "
+            "captions related and stylistically consistent: use the same exact proper "
+            "names, terminology, tense, and sentence pattern where appropriate, while "
+            "mentioning the view, action, or detail that distinguishes each photo. Do not "
+            "refer to photo numbers, 'this image', another photo, or an unsupported "
+            "temporal sequence in a caption. "
+            "Treat the optional user hint as high-priority factual context when it gives "
+            "names, locations, dates, events, or the shooting viewpoint. Silently correct "
+            "likely misspellings in the hint. "
+            "Actively inspect all photos for discriminating text, model or serial numbers, "
+            "logos, badges, signage, inscriptions, physical features, and location markers. "
+            "Use cross-photo evidence to resolve identities, but only state details that "
+            "are supported for the individual caption. Verify a resolvable specific "
+            "identity with web search instead of stopping at a generic class or guessing. "
+            "Identify visually central relationships, combinations, or states involving "
+            "the subjects. Put no more than two high-value, plausible Commons category "
+            "titles for such combinations in relationship_queries. "
+            "Generate category lookup queries for the group as a whole, emphasizing "
+            "specific subjects, locations, events, operators, object classes, and year "
+            "when relevant. Generate no more than 8 queries total across search_queries "
+            "and relationship_queries. Prioritize a standalone canonical-name query for "
+            "each central identified subject, and use separate queries for useful "
+            "subject/place or subject/state combinations. Every query should contain a "
+            "named subject, named place, model, operator, route, event, year, or similarly "
+            "concrete context; do not output bare visual descriptors. Prefer exact proper "
+            "names. Include a time-of-day query only when it is visually clear and useful. "
+            "Do not include photographic equipment categories; those are handled from "
+            "each photo's EXIF. In research_summary, briefly state facts found via web "
+            "search that affected the result, or return an empty string. Avoid speculation "
+            "and promotional language. "
+            f"The workflow will append this suffix after each number: {suffix_hint!r}."
         )
+        metadata_payload = [
+            {
+                "photo_number": index + 1,
+                "source_filename": (
+                    source_names[index] if source_names is not None else None
+                ),
+                "metadata": metadata.to_model_dict(),
+            }
+            for index, metadata in enumerate(metadatas)
+        ]
+        user_content: list[dict[str, Any]] = [
+            {
+                "type": "input_text",
+                "text": "Ordered photo metadata JSON:\n"
+                + json.dumps(metadata_payload, indent=2, sort_keys=True)
+                + "\n\nOptional user hint for the whole group:\n"
+                + (user_hint or "(none)"),
+            }
+        ]
+        for index, image_data_url in enumerate(image_data_urls):
+            user_content.extend(
+                [
+                    {
+                        "type": "input_text",
+                        "text": f"Photo {index + 1} of {photo_count}:",
+                    },
+                    {
+                        "type": "input_image",
+                        "image_url": image_data_url,
+                        "detail": self.config.image_detail,
+                    },
+                ]
+            )
         response = self.client.responses.create(
             model=self.config.vision_model,
-            reasoning={"effort": "medium"},
+            reasoning={"effort": "low"},
             tools=[{"type": "web_search", "search_context_size": "low"}],
             max_tool_calls=4,
             input=[
@@ -1098,29 +1289,157 @@ class VisionClient:
                     "role": "system",
                     "content": [{"type": "input_text", "text": instructions}],
                 },
-                {
-                    "role": "user",
-                    "content": [
-                        {
-                            "type": "input_text",
-                            "text": "Image metadata JSON:\n"
-                            + json.dumps(
-                                metadata.to_model_dict(), indent=2, sort_keys=True
-                            )
-                            + "\n\nOptional user hint:\n"
-                            + (user_hint or "(none)"),
-                        },
-                        {
-                            "type": "input_image",
-                            "image_url": image_data_url,
-                            "detail": self.config.image_detail,
-                        },
-                    ],
-                },
+                {"role": "user", "content": user_content},
             ],
-            text={"format": _json_schema("commons_upload_proposal", schema)},
+            text={"format": _json_schema("commons_group_upload_proposal", schema)},
         )
-        return json.loads(response.output_text)
+        proposal = json.loads(response.output_text)
+        if len(proposal.get("photos", [])) != photo_count:
+            raise RuntimeError(
+                "OpenAI returned metadata for a different number of photos "
+                f"({len(proposal.get('photos', []))} instead of {photo_count})"
+            )
+        return proposal
+
+    def propose_metadata(
+        self,
+        image_data_url: str,
+        metadata: PhotoMetadata,
+        suffix_hint: str,
+        user_hint: str,
+    ) -> dict[str, Any]:
+        """Backward-compatible single-photo wrapper."""
+        proposal = self.propose_group_metadata(
+            [image_data_url], [metadata], suffix_hint, user_hint
+        )
+        photo = proposal["photos"][0]
+        return {
+            "filename_stem": proposal["group_filename_stem"],
+            "caption_en": photo["caption_en"],
+            "visual_summary": photo["visual_summary"],
+            "keywords": proposal["keywords"],
+            "search_queries": proposal["search_queries"],
+            "relationship_queries": proposal["relationship_queries"],
+            "research_summary": proposal["research_summary"],
+        }
+
+    def choose_group_categories(
+        self,
+        image_data_urls: list[str],
+        metadatas: list[PhotoMetadata],
+        proposed_photos: list[dict[str, str]],
+        group_summary: str,
+        research_summary: str,
+        category_graph: dict[str, Any],
+        user_hint: str,
+    ) -> dict[str, Any]:
+        photo_count = len(image_data_urls)
+        if not (
+            photo_count
+            and len(metadatas) == photo_count
+            and len(proposed_photos) == photo_count
+        ):
+            raise ValueError("Category inputs must describe the same photo group")
+
+        print("Requesting consistent category selections from OpenAI...", flush=True)
+        schema = {
+            "type": "object",
+            "properties": {
+                "photo_categories": {
+                    "type": "array",
+                    "items": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                    },
+                    "minItems": photo_count,
+                    "maxItems": photo_count,
+                },
+                "reasoning_summary": {"type": "string"},
+            },
+            "required": ["photo_categories", "reasoning_summary"],
+            "additionalProperties": False,
+        }
+        instructions = (
+            f"You are selecting Wikimedia Commons topical categories for an ordered "
+            f"group of {photo_count} highly related photo(s). Return JSON only. Consider "
+            "all photos together, then return exactly one category array per photo in "
+            "input order. Choose only titles from the supplied candidate graph. Keep "
+            "category choices consistent across the group: use the same category for all "
+            "photos whenever it accurately applies, and vary only categories tied to a "
+            "visible difference in an individual photo. "
+            "Prefer the most specific applicable categories, especially titles combining "
+            "the depicted subject or scene type with the named place. Treat the user hint "
+            "as high-priority factual context. Each graph candidate includes file_count, "
+            "subcategory_count, and parent/child edges. In general, do not select a "
+            "zero-file category. Do not select both a category and its ancestor when the "
+            "child fully covers a photo. Avoid maintenance, creator, user, and campaign "
+            "categories. Do not add equipment or exposure categories; those are resolved "
+            "separately from each photo's EXIF. Choose only categories directly supported "
+            "by the individual photo, metadata, group context, or hint. Prefer specific "
+            "leaf categories for applicable places, operators, events, stations, vehicle "
+            "types, and years. Include a lighting or time-of-day category only when it is "
+            "visually clear in that photo. For station photos, a specific platform, "
+            "interior, roof, concourse, or train-service-at-station category is usually "
+            "better than a broad city, operator, or generic station category."
+        )
+        photo_context = [
+            {
+                "photo_number": index + 1,
+                "metadata": metadatas[index].to_model_dict(),
+                "proposed_caption": proposed_photos[index]["caption_en"],
+                "visual_summary": proposed_photos[index]["visual_summary"],
+            }
+            for index in range(photo_count)
+        ]
+        user_content: list[dict[str, Any]] = [
+            {
+                "type": "input_text",
+                "text": "Ordered photo context JSON:\n"
+                + json.dumps(photo_context, indent=2, sort_keys=True)
+                + "\n\nGroup visual summary:\n"
+                + group_summary
+                + "\n\nCurrent/researched context:\n"
+                + (research_summary or "(none)")
+                + "\n\nOptional user hint:\n"
+                + (user_hint or "(none)")
+                + "\n\nCandidate category graph JSON:\n"
+                + json.dumps(category_graph, indent=2, sort_keys=True),
+            }
+        ]
+        for index, image_data_url in enumerate(image_data_urls):
+            user_content.extend(
+                [
+                    {
+                        "type": "input_text",
+                        "text": f"Photo {index + 1} of {photo_count}:",
+                    },
+                    {
+                        "type": "input_image",
+                        "image_url": image_data_url,
+                        "detail": self.config.image_detail,
+                    },
+                ]
+            )
+        response = self.client.responses.create(
+            model=self.config.vision_model,
+            reasoning={"effort": "low"},
+            input=[
+                {
+                    "role": "system",
+                    "content": [{"type": "input_text", "text": instructions}],
+                },
+                {"role": "user", "content": user_content},
+            ],
+            text={"format": _json_schema("commons_group_category_selection", schema)},
+        )
+        selection = json.loads(response.output_text)
+        if len(selection.get("photo_categories", [])) != photo_count:
+            raise RuntimeError(
+                "OpenAI returned categories for a different number of photos "
+                f"({len(selection.get('photo_categories', []))} instead of "
+                f"{photo_count})"
+            )
+        return selection
 
     def choose_categories(
         self,
@@ -1132,76 +1451,25 @@ class VisionClient:
         category_graph: dict[str, Any],
         user_hint: str,
     ) -> dict[str, Any]:
-        print("Requesting final category selection from OpenAI...", flush=True)
-        schema = {
-            "type": "object",
-            "properties": {
-                "selected_categories": {
-                    "type": "array",
-                    "items": {"type": "string"},
-                },
-                "reasoning_summary": {"type": "string"},
-            },
-            "required": ["selected_categories", "reasoning_summary"],
-            "additionalProperties": False,
-        }
-        instructions = (
-            "You are selecting Wikimedia Commons topical categories for a single image. "
-            "Return JSON only. "
-            "Choose only from the supplied candidate graph. "
-            "Prefer the most specific applicable categories, especially categories whose title exactly combines the depicted object or scene type with the named place. "
-            "Treat the optional user hint as high-priority factual context when it identifies the subject, place, event, or named viewpoint, even if the image alone would be ambiguous. "
-            "If the hint implies a viewpoint or depiction relationship such as a landmark seen from a named overlook, prefer a candidate category that captures that exact relationship. "
-            "Each candidate includes file_count and subcategory_count from Commons, plus parent and child category edges. "
-            "In general, do not select categories with file_count = 0 for a photo upload, even if they have subcategories. "
-            "Prefer categories that already contain files when an otherwise-similar empty category is available. "
-            "Do not select both a category and its ancestor when the child already fully covers the image; choose the child. "
-            "Avoid maintenance, creator, user, and campaign categories. "
-            "Do not add photographic equipment or exposure parameter categories; those are handled separately. "
-            "Choose categories that are directly supported by the image and metadata. "
-            "If the image clearly shows a meaningful time-of-day or lighting condition such as dusk, sunset, dawn, or night, include an appropriate category for that when it exists in the candidate graph. "
-            "If a place, operator, event, station, vehicle type, or year category is clearly applicable, prefer the specific leaf category over a broad regional or parent category. "
-            "For station photos, a category such as Platforms, interiors, roofs, concourses, or specific train services at the named station is usually better than a broad city, operator, or generic station category when it accurately describes the image."
-        )
-        response = self.client.responses.create(
-            model=self.config.vision_model,
-            reasoning={"effort": "high"},
-            input=[
+        """Backward-compatible single-photo wrapper."""
+        selection = self.choose_group_categories(
+            image_data_urls=[image_data_url],
+            metadatas=[metadata],
+            proposed_photos=[
                 {
-                    "role": "system",
-                    "content": [{"type": "input_text", "text": instructions}],
-                },
-                {
-                    "role": "user",
-                    "content": [
-                        {
-                            "type": "input_text",
-                            "text": "Known metadata JSON:\n"
-                            + json.dumps(
-                                metadata.to_model_dict(), indent=2, sort_keys=True
-                            )
-                            + "\n\nProposed caption:\n"
-                            + proposed_caption
-                            + "\n\nVisual summary:\n"
-                            + proposed_summary
-                            + "\n\nCurrent/researched context:\n"
-                            + (research_summary or "(none)")
-                            + "\n\nOptional user hint:\n"
-                            + (user_hint or "(none)")
-                            + "\n\nCandidate category graph JSON:\n"
-                            + json.dumps(category_graph, indent=2, sort_keys=True),
-                        },
-                        {
-                            "type": "input_image",
-                            "image_url": image_data_url,
-                            "detail": self.config.image_detail,
-                        },
-                    ],
-                },
+                    "caption_en": proposed_caption,
+                    "visual_summary": proposed_summary,
+                }
             ],
-            text={"format": _json_schema("commons_category_selection", schema)},
+            group_summary=proposed_summary,
+            research_summary=research_summary,
+            category_graph=category_graph,
+            user_hint=user_hint,
         )
-        return json.loads(response.output_text)
+        return {
+            "selected_categories": selection["photo_categories"][0],
+            "reasoning_summary": selection["reasoning_summary"],
+        }
 
 
 def _preferred_filename(stem: str, suffix: str, ext: str) -> str:
@@ -1213,6 +1481,32 @@ def _preferred_filename(stem: str, suffix: str, ext: str) -> str:
     if suffix.strip():
         sanitized = f"{sanitized} {suffix.strip()}".strip()
     return f"{sanitized}{ext.lower()}"
+
+
+def _numbered_filenames(
+    group_stem: str, suffix: str, extensions: list[str]
+) -> list[str]:
+    """Build stable, ordered names; a single-photo upload keeps its old name shape."""
+    photo_count = len(extensions)
+    if photo_count == 0:
+        return []
+    number_width = max(2, len(str(photo_count)))
+    return [
+        _preferred_filename(
+            (
+                group_stem
+                if photo_count == 1
+                else f"{group_stem} {index:0{number_width}d}"
+            ),
+            suffix,
+            extension,
+        )
+        for index, extension in enumerate(extensions, start=1)
+    ]
+
+
+def _commons_filename_key(filename: str) -> str:
+    return re.sub(r"[ _]+", " ", filename).strip().casefold()
 
 
 def _equipment_category_candidates(metadata: PhotoMetadata) -> list[str]:
@@ -1240,6 +1534,27 @@ def _resolve_equipment_categories(
         if commons_api.category_exists(title):
             categories.append(title.removeprefix("Category:"))
     return categories
+
+
+def _resolve_group_equipment_categories(
+    commons_api: CommonsApi, metadatas: list[PhotoMetadata]
+) -> list[list[str]]:
+    print("Resolving equipment and exposure categories from group EXIF...", flush=True)
+    candidates_by_photo = [
+        _equipment_category_candidates(metadata) for metadata in metadatas
+    ]
+    all_candidates = _dedupe_preserve_order(
+        [title for candidates in candidates_by_photo for title in candidates]
+    )
+    existing_titles = set(commons_api.existing_category_titles(all_candidates))
+    return [
+        [
+            title.removeprefix("Category:")
+            for title in candidates
+            if title in existing_titles
+        ]
+        for candidates in candidates_by_photo
+    ]
 
 
 def _dedupe_preserve_order(values: list[str]) -> list[str]:
@@ -1468,6 +1783,9 @@ def _refine_category_intersections(
     selected_categories: list[str],
     graph: dict[str, Any],
     evidence: list[str],
+    intersection_cache: (
+        dict[tuple[tuple[str, str], ...], dict[str, dict[str, Any]]] | None
+    ) = None,
 ) -> list[str]:
     if len(selected_categories) < 2:
         return selected_categories
@@ -1497,10 +1815,16 @@ def _refine_category_intersections(
         pair for _, _, _, pair in ranked_pairs[:MAX_CATEGORY_INTERSECTION_PAIRS]
     ]
 
-    intersection_details = commons_api.search_category_intersections(
-        category_pairs,
-        MAX_CATEGORY_INTERSECTION_RESULTS,
-    )
+    cache_key = tuple(category_pairs)
+    if intersection_cache is not None and cache_key in intersection_cache:
+        intersection_details = intersection_cache[cache_key]
+    else:
+        intersection_details = commons_api.search_category_intersections(
+            category_pairs,
+            MAX_CATEGORY_INTERSECTION_RESULTS,
+        )
+        if intersection_cache is not None:
+            intersection_cache[cache_key] = intersection_details
     selected_titles = {f"Category:{category}" for category in selected_categories}
     refinements: list[str] = []
     for title, details in intersection_details.items():
@@ -1566,14 +1890,38 @@ def _raw_sha1_field(metadata: PhotoMetadata) -> str:
     )
 
 
+def _wikitext_batch_gallery(filenames: list[str]) -> str:
+    normalized_filenames: list[str] = []
+    for filename in filenames:
+        normalized = str(filename).strip().removeprefix("File:").strip()
+        normalized = re.sub(r"[\r\n\[\]{}|<>#%]+", " ", normalized)
+        normalized = re.sub(r"\s+", " ", normalized).strip()
+        if normalized:
+            normalized_filenames.append(normalized)
+    normalized_filenames = _dedupe_preserve_order(normalized_filenames)
+    if len(normalized_filenames) <= 1:
+        return ""
+    gallery_files = "\n".join(
+        f"File:{filename}" for filename in normalized_filenames
+    )
+    return (
+        '\n<gallery mode="packed" heights="120" showfilename="yes" '
+        'caption="Related images in this batch">\n'
+        f"{gallery_files}\n"
+        "</gallery>"
+    )
+
+
 def build_description_wikitext(
     caption: str,
     metadata: PhotoMetadata,
     author: str,
     license_wikitext: str,
     categories: list[str],
+    batch_filenames: list[str] | None = None,
 ) -> str:
     date_value = metadata.captured_on or datetime.now(timezone.utc).date().isoformat()
+    batch_gallery = _wikitext_batch_gallery(batch_filenames or [])
     return (
         "=={{int:filedesc}}==\n"
         "{{Information\n"
@@ -1583,7 +1931,8 @@ def build_description_wikitext(
         "|source = {{own}}\n"
         f"|author = {author}"
         f"{_raw_sha1_field(metadata)}\n"
-        "}}\n"
+        "}}"
+        f"{batch_gallery}\n"
         f"{_wikitext_location(metadata)}\n\n"
         "=={{int:license-header}}==\n"
         f"{license_wikitext}\n\n"
@@ -1598,25 +1947,65 @@ def _free_port(host: str) -> int:
 
 
 def _html_page(state: dict[str, Any]) -> str:
-    warning_banner = ""
-    if state.get("sha1_matches"):
-        sha1_line = ""
-        if state.get("raw_sha1sum"):
-            sha1_line = f"<p><code>{escape(state['raw_sha1sum'])}</code></p>"
-        match_items = "".join(
-            f'<li><a href="{escape(item["url"])}" target="_blank" rel="noreferrer">{escape(item["title"])}</a>'
-            f'<button type="button" class="overwrite-btn" data-file-title="{escape(item["title"], quote=True)}">Overwrite this file</button></li>'
-            for item in state.get("sha1_matches", [])
+    photos = state.get("photos")
+    if not isinstance(photos, list) or not photos:
+        photos = [
+            {
+                "index": 0,
+                "source_name": "Photo",
+                "metadata": state.get("metadata", {}),
+                "raw_sha1sum": state.get("raw_sha1sum"),
+                "sha1_matches": state.get("sha1_matches", []),
+            }
+        ]
+    photo_count = len(photos)
+
+    warning_banners: list[str] = []
+    preview_cards: list[str] = []
+    for position, photo in enumerate(photos):
+        photo_index = int(photo.get("index", position))
+        source_name = str(photo.get("source_name") or f"Photo {position + 1}")
+        matches = photo.get("sha1_matches", [])
+        if matches:
+            sha1_line = ""
+            if photo.get("raw_sha1sum"):
+                sha1_line = (
+                    f'<p><code>{escape(str(photo["raw_sha1sum"]))}</code></p>'
+                )
+            match_items = "".join(
+                f'<li><a href="{escape(str(item["url"]), quote=True)}" '
+                f'target="_blank" rel="noreferrer">{escape(str(item["title"]))}</a>'
+                f'<button type="button" class="overwrite-btn" '
+                f'data-photo-index="{photo_index}" '
+                f'data-file-title="{escape(str(item["title"]), quote=True)}">'
+                "Overwrite this file</button></li>"
+                for item in matches
+            )
+            label = f"Photo {position + 1}" if photo_count > 1 else "This photo"
+            warning_banners.append(
+                '<div class="warning-banner">'
+                f"<h2>Possible Existing Upload: {escape(label)}</h2>"
+                "<p>Its raw SHA1 sum was found on Commons. Continue if this is "
+                "intentionally different, or overwrite an existing file if this is a "
+                "minor improved version.</p>"
+                + sha1_line
+                + "<ul>"
+                + match_items
+                + "</ul></div>"
+            )
+
+        preview_label = f"Photo {position + 1}" if photo_count > 1 else "Photo"
+        preview_cards.append(
+            '<section class="card image-card">'
+            f'<div class="photo-label"><strong>{escape(preview_label)}</strong>'
+            f"<span>{escape(source_name)}</span></div>"
+            f'<img src="/image/{photo_index}" alt="Upload preview {position + 1}">'
+            "<details class=\"meta\"><summary>Metadata</summary><pre>"
+            + escape(json.dumps(photo.get("metadata", {}), indent=2, sort_keys=True))
+            + "</pre></details></section>"
         )
-        warning_banner = (
-            '<div class="warning-banner">'
-            "<h2>Possible Existing Uploads</h2>"
-            "<p>This photo's raw SHA1 sum was found on Commons. These may be existing uploads of the same source file or variants derived from it. You can still continue if this upload is intentionally different, or overwrite one of these files if this is a minor improved version.</p>"
-            + sha1_line
-            + "<ul>"
-            + match_items
-            + "</ul></div>"
-        )
+    warning_banner = "".join(warning_banners)
+    preview_html = "".join(preview_cards)
     qi_count = int(state.get("quality_image_nominations_today", 0))
     qi_limit = int(state.get("quality_image_nomination_limit", 5))
     qi_date = str(state.get("quality_image_nomination_date", "today"))
@@ -1628,6 +2017,13 @@ def _html_page(state: dict[str, Any]) -> str:
             f"nominations already listed for {escape(qi_date)} UTC."
             "</p>"
         )
+    qi_disabled = "true" if qi_count >= qi_limit else "false"
+    upload_label = "Save and upload" if photo_count == 1 else f"Upload {photo_count} photos"
+    prepare_heading = (
+        "Prepare Commons Upload"
+        if photo_count == 1
+        else f"Prepare {photo_count}-Photo Commons Group"
+    )
     return f"""<!doctype html>
 <html lang="en">
 <head>
@@ -1650,12 +2046,17 @@ def _html_page(state: dict[str, Any]) -> str:
       color: var(--ink);
     }}
     .page {{
-      max-width: 1180px;
+      max-width: 1320px;
       margin: 0 auto;
       padding: 24px;
       display: grid;
       gap: 24px;
-      grid-template-columns: minmax(320px, 1fr) minmax(360px, 460px);
+      grid-template-columns: minmax(320px, 1fr) minmax(420px, 560px);
+      align-items: start;
+    }}
+    .photo-stack {{
+      display: grid;
+      gap: 24px;
     }}
     .card {{
       background: rgba(255,250,240,.92);
@@ -1670,14 +2071,40 @@ def _html_page(state: dict[str, Any]) -> str:
       height: auto;
       background: #ddd4c5;
     }}
+    .photo-label {{
+      padding: 13px 18px;
+      display: flex;
+      justify-content: space-between;
+      gap: 12px;
+      border-bottom: 1px solid var(--line);
+      font-size: 14px;
+      overflow-wrap: anywhere;
+    }}
+    .photo-label span {{
+      color: #6b5745;
+      text-align: right;
+    }}
     .meta {{
       padding: 18px 20px;
       font-size: 14px;
       line-height: 1.5;
       border-top: 1px solid var(--line);
     }}
+    .meta summary {{
+      cursor: pointer;
+      font-weight: 700;
+    }}
+    .meta pre {{
+      overflow-x: auto;
+      white-space: pre-wrap;
+      overflow-wrap: anywhere;
+    }}
     .form-card {{
       padding: 20px;
+      position: sticky;
+      top: 24px;
+      max-height: calc(100vh - 48px);
+      overflow-y: auto;
     }}
     .warning-banner {{
       margin: 0 0 18px;
@@ -1729,6 +2156,10 @@ def _html_page(state: dict[str, Any]) -> str:
       font-size: 28px;
       line-height: 1.1;
     }}
+    h2 {{
+      margin: 0 0 8px;
+      font-size: 21px;
+    }}
     label {{
       display: block;
       margin: 16px 0 8px;
@@ -1753,6 +2184,17 @@ def _html_page(state: dict[str, Any]) -> str:
       grid-template-columns: 1fr auto;
       gap: 8px;
       margin-bottom: 8px;
+    }}
+    .photo-editor {{
+      margin-top: 22px;
+      padding-top: 20px;
+      border-top: 1px solid var(--line);
+    }}
+    .photo-editor:first-child {{
+      margin-top: 16px;
+    }}
+    .photo-editor.skipped {{
+      display: none;
     }}
     button {{
       border: 0;
@@ -1797,6 +2239,16 @@ def _html_page(state: dict[str, Any]) -> str:
       color: #8e3b1b;
       font-weight: 700;
     }}
+    .group-note {{
+      color: #5f4635;
+      line-height: 1.45;
+    }}
+    .completion-list {{
+      padding-left: 20px;
+    }}
+    .completion-list li + li {{
+      margin-top: 8px;
+    }}
     .spinner {{
       width: 18px;
       height: 18px;
@@ -1831,22 +2283,23 @@ def _html_page(state: dict[str, Any]) -> str:
       .page {{
         grid-template-columns: 1fr;
       }}
+      .form-card {{
+        position: static;
+        max-height: none;
+      }}
     }}
   </style>
 </head>
 <body>
   <div class="page">
-    <section class="card image-card">
-      <img src="/image" alt="Upload preview">
-      <div class="meta"><strong>Metadata</strong><pre>{escape(json.dumps(state["metadata"], indent=2, sort_keys=True))}</pre></div>
-    </section>
+    <div class="photo-stack">{preview_html}</div>
     <section class="card form-card">
       <div id="hint-stage">
-        <h1>Prepare Commons Upload</h1>
+        <h1>{escape(prepare_heading)}</h1>
         {warning_banner}
-        <p>Add an optional hint if the model may struggle to identify the subject, location, event, or other context from the image alone.</p>
+        <p>Add one optional hint for the whole group. The model will inspect all photos together, then propose consistent captions, categories, and ordered filenames.</p>
         <label for="hint">Hint</label>
-        <textarea id="hint" placeholder="Optional: identify the subject, place, event, or any other context for the AI."></textarea>
+        <textarea id="hint" placeholder="Optional: identify the shared subject, place, event, viewpoint, or other context."></textarea>
         <div class="actions">
           <button type="button" class="primary" id="analyze">Generate proposal</button>
         </div>
@@ -1858,21 +2311,12 @@ def _html_page(state: dict[str, Any]) -> str:
         <div class="actions">
           <button type="button" class="secondary" id="redo">Redo with hint</button>
         </div>
-        <label for="filename">Filename</label>
-        <input id="filename" type="text" value="">
-        <label for="caption">Caption</label>
-        <textarea id="caption"></textarea>
-        <label>Categories</label>
-        <div id="categories"></div>
-        <button type="button" class="secondary" id="add-category">Add category</button>
-        <label class="checkbox-row">
-          <input id="quality-image" type="checkbox" {"disabled" if qi_count >= qi_limit else ""}>
-          <span>Nominate as Quality Image</span>
-        </label>
+        <p class="group-note">The topical categories were selected using the whole group. Filename numbers follow the command-line order. Equipment and exposure categories were resolved separately for each photo.</p>
+        <div id="photo-fields"></div>
         <p class="inline-note">{escape(str(qi_count))}/{escape(str(qi_limit))} Quality Image nominations listed for {escape(qi_date)} UTC.</p>
         {qi_warning}
         <div class="actions">
-          <button type="button" class="primary" id="submit">Save and upload</button>
+          <button type="button" class="primary" id="submit">{escape(upload_label)}</button>
         </div>
       </div>
       <div class="actions">
@@ -1882,34 +2326,76 @@ def _html_page(state: dict[str, Any]) -> str:
     </section>
   </div>
   <script>
-    const categories = document.getElementById("categories");
+    const photoCount = {photo_count};
+    const qualityImageDisabled = {qi_disabled};
+    const skippedPhotoIndexes = new Set();
+    const completedUploads = new Map();
+    const photoFields = document.getElementById("photo-fields");
     const spinner = document.getElementById("spinner");
     const status = document.getElementById("status");
     const hintStage = document.getElementById("hint-stage");
     const reviewStage = document.getElementById("review-stage");
-    function wireRemoveButtons(root) {{
-      root.querySelectorAll(".remove-btn").forEach((button) => {{
-        button.onclick = () => button.parentElement.remove();
-      }});
-    }}
-    function addCategory(value = "") {{
+    function addCategory(container, value = "") {{
       const row = document.createElement("div");
       row.className = "category-row";
       row.innerHTML = '<input type="text" class="category-input"><button type="button" class="remove-btn">Remove</button>';
       row.querySelector(".category-input").value = value;
-      categories.appendChild(row);
-      wireRemoveButtons(row);
+      row.querySelector(".remove-btn").onclick = () => row.remove();
+      container.appendChild(row);
     }}
-    wireRemoveButtons(document);
-    document.getElementById("add-category").onclick = () => addCategory("");
+
+    function buildPhotoEditor(photo, position) {{
+      const editor = document.createElement("section");
+      editor.className = "photo-editor";
+      editor.dataset.photoIndex = String(photo.index);
+      const heading = photoCount > 1 ? `Photo ${{position + 1}}` : "Photo";
+      editor.innerHTML = `
+        <h2>${{heading}}</h2>
+        <label>Filename</label>
+        <input type="text" class="filename-input">
+        <label>Caption</label>
+        <textarea class="caption-input"></textarea>
+        <label>Categories</label>
+        <div class="photo-categories"></div>
+        <button type="button" class="secondary add-category">Add category</button>
+        <label class="checkbox-row">
+          <input type="checkbox" class="quality-image-input">
+          <span>Nominate as Quality Image</span>
+        </label>`;
+      editor.querySelector(".filename-input").value = photo.filename;
+      editor.querySelector(".caption-input").value = photo.caption;
+      const categoryContainer = editor.querySelector(".photo-categories");
+      photo.categories.forEach((category) => addCategory(categoryContainer, category));
+      editor.querySelector(".add-category").onclick = () =>
+        addCategory(categoryContainer, "");
+      editor.querySelector(".quality-image-input").disabled = qualityImageDisabled;
+      if (skippedPhotoIndexes.has(Number(photo.index))) {{
+        editor.classList.add("skipped");
+      }}
+      return editor;
+    }}
+
     document.querySelectorAll(".overwrite-btn").forEach((button) => {{
       button.onclick = async () => {{
         const title = button.dataset.fileTitle;
+        const photoIndex = Number(button.dataset.photoIndex);
         setBusy(`Overwriting ${{title}}...`);
         try {{
-          const data = await postJson("/overwrite", {{ title }}, "overwrite");
-          clearBusy("Overwrite complete. Redirecting...");
-          window.location.href = data.redirect_url;
+          const data = await postJson("/overwrite", {{ title, photo_index: photoIndex }}, "overwrite");
+          if (photoCount === 1) {{
+            clearBusy("Overwrite complete. Redirecting...");
+            window.location.href = data.redirect_url;
+            return;
+          }}
+          skippedPhotoIndexes.add(photoIndex);
+          button.disabled = true;
+          button.textContent = "Overwritten; omitted from batch";
+          const editor = document.querySelector(
+            `.photo-editor[data-photo-index="${{photoIndex}}"]`
+          );
+          if (editor) editor.classList.add("skipped");
+          window.open(data.redirect_url, "_blank", "noopener");
+          clearBusy("Overwrite complete. That photo will be omitted from the new uploads.");
         }} catch (error) {{
           clearBusy(error.message || "Overwrite failed", true);
           return;
@@ -1965,16 +2451,26 @@ def _html_page(state: dict[str, Any]) -> str:
       }}
 
       if (!response.ok) {{
-        throw new Error(data.error || action.charAt(0).toUpperCase() + action.slice(1) + " failed");
+        const requestError = new Error(
+          data.error || action.charAt(0).toUpperCase() + action.slice(1) + " failed"
+        );
+        requestError.responseData = data;
+        throw requestError;
       }}
       return data;
     }}
     function populateReview(data) {{
       document.getElementById("review-hint").value = data.hint || "";
-      document.getElementById("filename").value = data.filename;
-      document.getElementById("caption").value = data.caption;
-      categories.innerHTML = "";
-      data.categories.forEach((category) => addCategory(category));
+      const proposedPhotos = data.photos || [{{
+        index: 0,
+        filename: data.filename,
+        caption: data.caption,
+        categories: data.categories,
+      }}];
+      photoFields.innerHTML = "";
+      proposedPhotos.forEach((photo, position) =>
+        photoFields.appendChild(buildPhotoEditor(photo, position))
+      );
       hintStage.style.display = "none";
       reviewStage.style.display = "block";
     }}
@@ -2000,21 +2496,67 @@ def _html_page(state: dict[str, Any]) -> str:
       await analyzeWithHint(hintValue);
     }};
     document.getElementById("submit").onclick = async () => {{
-      setBusy("Uploading...");
+      const photos = Array.from(document.querySelectorAll(".photo-editor"))
+        .filter((editor) => !skippedPhotoIndexes.has(Number(editor.dataset.photoIndex)))
+        .map((editor) => ({{
+          index: Number(editor.dataset.photoIndex),
+          filename: editor.querySelector(".filename-input").value,
+          caption: editor.querySelector(".caption-input").value,
+          categories: Array.from(editor.querySelectorAll(".category-input"))
+            .map((node) => node.value.trim())
+            .filter(Boolean),
+          nominate_quality_image: editor.querySelector(".quality-image-input").checked,
+        }}));
+      if (!photos.length) {{
+        clearBusy("There are no photos left to upload in this session.", true);
+        return;
+      }}
+      setBusy(photos.length === 1 ? "Uploading..." : `Uploading ${{photos.length}} photos...`);
       const payload = {{
-        filename: document.getElementById("filename").value,
-        caption: document.getElementById("caption").value,
-        categories: Array.from(document.querySelectorAll(".category-input"))
-          .map((node) => node.value.trim())
-          .filter(Boolean),
-        nominate_quality_image: document.getElementById("quality-image").checked,
+        photos,
       }};
       try {{
         const data = await postJson("/submit", payload, "upload");
-        clearBusy("Upload complete. Redirecting...");
-        window.location.href = data.redirect_url;
+        data.uploaded_files.forEach((file) => completedUploads.set(file.index, file));
+        const allUploadedFiles = Array.from(completedUploads.values())
+          .sort((left, right) => left.index - right.index);
+        if (photoCount === 1) {{
+          clearBusy("Upload complete. Redirecting...");
+          window.location.href = data.redirect_url;
+          return;
+        }}
+        reviewStage.innerHTML = "<h1>Upload complete</h1>";
+        const message = document.createElement("p");
+        message.textContent = `${{allUploadedFiles.length}} photos uploaded successfully.`;
+        reviewStage.appendChild(message);
+        const list = document.createElement("ol");
+        list.className = "completion-list";
+        allUploadedFiles.forEach((file) => {{
+          const item = document.createElement("li");
+          const link = document.createElement("a");
+          link.href = file.url;
+          link.textContent = file.filename;
+          link.target = "_blank";
+          link.rel = "noreferrer";
+          item.appendChild(link);
+          list.appendChild(item);
+        }});
+        reviewStage.appendChild(list);
+        clearBusy("Batch upload complete.");
       }} catch (error) {{
-        clearBusy(error.message || "Upload failed", true);
+        const uploadedBeforeError = error.responseData?.uploaded_files || [];
+        uploadedBeforeError.forEach((file) => {{
+          completedUploads.set(file.index, file);
+          skippedPhotoIndexes.add(file.index);
+          const editor = document.querySelector(
+            `.photo-editor[data-photo-index="${{file.index}}"]`
+          );
+          if (editor) editor.classList.add("skipped");
+        }});
+        const retryNote = uploadedBeforeError.length
+          ? " Successfully uploaded items were hidden; after addressing the error, retry to upload only the remaining items."
+          : "";
+        clearBusy((error.message || "Upload failed") + retryNote, true);
         return;
       }}
     }};
@@ -2049,27 +2591,86 @@ def _commons_file_url(title: str) -> str:
     return "https://commons.wikimedia.org/wiki/" + title.replace(" ", "_")
 
 
-def run_app(image_path: Path) -> None:
+def _normalize_image_paths(image_paths: Path | list[Path]) -> list[Path]:
+    paths = [image_paths] if isinstance(image_paths, Path) else list(image_paths)
+    if not paths:
+        raise SystemExit("At least one image path is required")
+
+    resolved_paths: list[Path] = []
+    seen: set[Path] = set()
+    for image_path in paths:
+        resolved = image_path.expanduser().resolve()
+        if not resolved.is_file():
+            raise SystemExit(f"Image path is not a file: {resolved}")
+        if resolved in seen:
+            raise SystemExit(f"Image path was supplied more than once: {resolved}")
+        seen.add(resolved)
+        resolved_paths.append(resolved)
+    return resolved_paths
+
+
+def run_app(image_paths: Path | list[Path]) -> None:
     app_config = load_config()
     commons_config = app_config.commons
     openai_config = app_config.openai
     _validate_required_config(commons_config, openai_config)
-    image_path = image_path.resolve()
-    print(f"Preparing Commons upload for {image_path}", flush=True)
-
-    print("Reading image metadata...", flush=True)
-    metadata = _read_metadata(image_path)
-    upload_image_path, upload_temp_dir = _upload_safe_image_path(image_path, metadata)
+    resolved_paths = _normalize_image_paths(image_paths)
+    photo_count = len(resolved_paths)
     print(
-        "Metadata summary: "
-        + json.dumps(metadata.to_model_dict(), sort_keys=True, ensure_ascii=True),
+        f"Preparing Commons upload for {photo_count} photo"
+        + ("" if photo_count == 1 else "s"),
         flush=True,
     )
-    print("Creating downsized preview for vision analysis...", flush=True)
-    downsized_bytes, mime_type = _downsize_image(
-        image_path, openai_config.downsized_max_dimension
-    )
-    image_data_url = _image_data_url(downsized_bytes, mime_type)
+
+    prepared_photos: list[PreparedPhoto] = []
+    try:
+        for index, image_path in enumerate(resolved_paths, start=1):
+            print(
+                f"Reading image metadata ({index}/{photo_count}): {image_path}",
+                flush=True,
+            )
+            metadata = _read_metadata(image_path)
+            upload_image_path, upload_temp_dir = _upload_safe_image_path(
+                image_path, metadata
+            )
+            try:
+                print(
+                    "Metadata summary: "
+                    + json.dumps(
+                        metadata.to_model_dict(), sort_keys=True, ensure_ascii=True
+                    ),
+                    flush=True,
+                )
+                print(
+                    f"Creating downsized preview ({index}/{photo_count})...",
+                    flush=True,
+                )
+                preview_bytes, preview_mime_type = _downsize_image(
+                    image_path, openai_config.downsized_max_dimension
+                )
+                prepared_photos.append(
+                    PreparedPhoto(
+                        source_path=image_path,
+                        upload_path=upload_image_path,
+                        upload_temp_dir=upload_temp_dir,
+                        metadata=metadata,
+                        preview_bytes=preview_bytes,
+                        preview_mime_type=preview_mime_type,
+                        image_data_url=_image_data_url(
+                            preview_bytes, preview_mime_type
+                        ),
+                        sha1_matches=[],
+                    )
+                )
+            except Exception:
+                if upload_temp_dir is not None:
+                    upload_temp_dir.cleanup()
+                raise
+    except Exception:
+        for photo in prepared_photos:
+            if photo.upload_temp_dir is not None:
+                photo.upload_temp_dir.cleanup()
+        raise
 
     vision = VisionClient(openai_config)
     commons_api = CommonsApi(commons_config)
@@ -2085,25 +2686,42 @@ def run_app(image_path: Path) -> None:
         f"{QUALITY_IMAGE_DAILY_NOMINATION_LIMIT}",
         flush=True,
     )
-    sha1_matches: list[dict[str, str]] = []
-    if metadata.raw_sha1sum:
-        sha1_matches = [
+    for index, photo in enumerate(prepared_photos, start=1):
+        if not photo.metadata.raw_sha1sum:
+            continue
+        photo.sha1_matches = [
             {"title": title, "url": _commons_file_url(title)}
-            for title in commons_api.search_files_by_raw_sha1(metadata.raw_sha1sum)
+            for title in commons_api.search_files_by_raw_sha1(
+                photo.metadata.raw_sha1sum
+            )
         ]
-        if sha1_matches:
+        if photo.sha1_matches:
             print(
-                "Found Commons files with matching raw SHA1 sum: "
+                f"Found Commons files matching photo {index}'s raw SHA1 sum: "
                 + json.dumps(
-                    [item["title"] for item in sha1_matches], ensure_ascii=True
+                    [item["title"] for item in photo.sha1_matches],
+                    ensure_ascii=True,
                 ),
                 flush=True,
             )
 
+    photo_state = [
+        {
+            "index": index,
+            "source_name": photo.source_path.name,
+            "metadata": photo.metadata.to_model_dict(),
+            "raw_sha1sum": photo.metadata.raw_sha1sum,
+            "sha1_matches": photo.sha1_matches,
+        }
+        for index, photo in enumerate(prepared_photos)
+    ]
     state = {
-        "metadata": metadata.to_model_dict(),
-        "raw_sha1sum": metadata.raw_sha1sum,
-        "sha1_matches": sha1_matches,
+        "photos": photo_state,
+        "photo_count": photo_count,
+        # Keep the single-photo keys for callers that render _html_page directly.
+        "metadata": photo_state[0]["metadata"],
+        "raw_sha1sum": photo_state[0]["raw_sha1sum"],
+        "sha1_matches": photo_state[0]["sha1_matches"],
         "quality_image_nominations_today": quality_image_nominations_today,
         "quality_image_nomination_limit": QUALITY_IMAGE_DAILY_NOMINATION_LIMIT,
         "quality_image_nomination_date": _utc_date_label(quality_image_nomination_date),
@@ -2111,13 +2729,36 @@ def run_app(image_path: Path) -> None:
 
     def generate_review_state(user_hint: str) -> dict[str, Any]:
         print(f"Starting AI analysis pipeline. Hint: {user_hint!r}", flush=True)
-        proposal = vision.propose_metadata(
-            image_data_url=image_data_url,
-            metadata=metadata,
-            suffix_hint=commons_config.filename_suffix,
-            user_hint=user_hint,
-        )
-        print("OpenAI proposal received.", flush=True)
+        if photo_count == 1:
+            single_proposal = vision.propose_metadata(
+                image_data_url=prepared_photos[0].image_data_url,
+                metadata=prepared_photos[0].metadata,
+                suffix_hint=commons_config.filename_suffix,
+                user_hint=user_hint,
+            )
+            proposal = {
+                "group_filename_stem": single_proposal["filename_stem"],
+                "photos": [
+                    {
+                        "caption_en": single_proposal["caption_en"],
+                        "visual_summary": single_proposal["visual_summary"],
+                    }
+                ],
+                "keywords": single_proposal["keywords"],
+                "search_queries": single_proposal["search_queries"],
+                "relationship_queries": single_proposal["relationship_queries"],
+                "group_summary": single_proposal["visual_summary"],
+                "research_summary": single_proposal["research_summary"],
+            }
+        else:
+            proposal = vision.propose_group_metadata(
+                image_data_urls=[photo.image_data_url for photo in prepared_photos],
+                metadatas=[photo.metadata for photo in prepared_photos],
+                suffix_hint=commons_config.filename_suffix,
+                user_hint=user_hint,
+                source_names=[photo.source_path.name for photo in prepared_photos],
+            )
+        print("OpenAI group proposal received.", flush=True)
         relationship_queries = _dedupe_preserve_order(
             [
                 re.sub(r"\s+", " ", str(query).removeprefix("Category:").strip())
@@ -2160,52 +2801,109 @@ def run_app(image_path: Path) -> None:
             max_candidate_categories=commons_config.max_candidate_categories,
             max_parent_depth=commons_config.max_parent_depth,
         )
-        selected = vision.choose_categories(
-            image_data_url=image_data_url,
-            metadata=metadata,
-            proposed_caption=proposal["caption_en"],
-            proposed_summary=proposal["visual_summary"],
-            research_summary=proposal["research_summary"],
-            category_graph=category_graph,
-            user_hint=user_hint,
+        if photo_count == 1:
+            single_selection = vision.choose_categories(
+                image_data_url=prepared_photos[0].image_data_url,
+                metadata=prepared_photos[0].metadata,
+                proposed_caption=proposal["photos"][0]["caption_en"],
+                proposed_summary=proposal["photos"][0]["visual_summary"],
+                research_summary=proposal["research_summary"],
+                category_graph=category_graph,
+                user_hint=user_hint,
+            )
+            selected = {
+                "photo_categories": [single_selection["selected_categories"]],
+                "reasoning_summary": single_selection["reasoning_summary"],
+            }
+        else:
+            selected = vision.choose_group_categories(
+                image_data_urls=[photo.image_data_url for photo in prepared_photos],
+                metadatas=[photo.metadata for photo in prepared_photos],
+                proposed_photos=proposal["photos"],
+                group_summary=proposal["group_summary"],
+                research_summary=proposal["research_summary"],
+                category_graph=category_graph,
+                user_hint=user_hint,
+            )
+        print("OpenAI group category selection received.", flush=True)
+        filenames = _numbered_filenames(
+            proposal["group_filename_stem"],
+            commons_config.filename_suffix,
+            [photo.upload_path.suffix for photo in prepared_photos],
         )
-        print("OpenAI category selection received.", flush=True)
-        model_categories = [
-            title.removeprefix("Category:") for title in selected["selected_categories"]
-        ]
-        model_categories = _remove_empty_categories(model_categories, category_graph)
-        model_categories = _remove_ancestor_duplicates(model_categories, category_graph)
-        model_categories = _refine_category_intersections(
-            commons_api,
-            model_categories,
-            category_graph,
-            evidence=[
-                proposal["caption_en"],
-                proposal["visual_summary"],
-                proposal["research_summary"],
-                user_hint,
-                *proposal["keywords"],
-                *relationship_queries,
-            ],
-        )
-        equipment_categories = _resolve_equipment_categories(commons_api, metadata)
-        all_categories = _dedupe_preserve_order(model_categories + equipment_categories)
-        print(
-            "Initial proposed categories: "
-            + json.dumps(all_categories, ensure_ascii=True),
-            flush=True,
-        )
-        return {
-            "hint": user_hint,
-            "filename": _preferred_filename(
-                proposal["filename_stem"],
-                commons_config.filename_suffix,
-                upload_image_path.suffix,
-            ),
-            "caption": proposal["caption_en"],
-            "categories": all_categories,
-        }
+        if photo_count == 1:
+            equipment_categories_by_photo = [
+                _resolve_equipment_categories(
+                    commons_api, prepared_photos[0].metadata
+                )
+            ]
+        else:
+            equipment_categories_by_photo = _resolve_group_equipment_categories(
+                commons_api, [photo.metadata for photo in prepared_photos]
+            )
+        intersection_cache: dict[
+            tuple[tuple[str, str], ...], dict[str, dict[str, Any]]
+        ] = {}
+        review_photos: list[dict[str, Any]] = []
+        for index, photo in enumerate(prepared_photos):
+            photo_proposal = proposal["photos"][index]
+            model_categories = [
+                str(title).removeprefix("Category:")
+                for title in selected["photo_categories"][index]
+            ]
+            model_categories = _remove_empty_categories(
+                model_categories, category_graph
+            )
+            model_categories = _remove_ancestor_duplicates(
+                model_categories, category_graph
+            )
+            model_categories = _refine_category_intersections(
+                commons_api,
+                model_categories,
+                category_graph,
+                evidence=[
+                    photo_proposal["caption_en"],
+                    photo_proposal["visual_summary"],
+                    proposal["group_summary"],
+                    proposal["research_summary"],
+                    user_hint,
+                    *proposal["keywords"],
+                    *relationship_queries,
+                ],
+                intersection_cache=intersection_cache,
+            )
+            all_categories = _dedupe_preserve_order(
+                model_categories + equipment_categories_by_photo[index]
+            )
+            print(
+                f"Initial proposed categories for photo {index + 1}: "
+                + json.dumps(all_categories, ensure_ascii=True),
+                flush=True,
+            )
+            review_photos.append(
+                {
+                    "index": index,
+                    "filename": filenames[index],
+                    "caption": photo_proposal["caption_en"],
+                    "categories": all_categories,
+                }
+            )
 
+        review_state: dict[str, Any] = {
+            "hint": user_hint,
+            "photos": review_photos,
+        }
+        if photo_count == 1:
+            review_state.update(
+                {
+                    "filename": review_photos[0]["filename"],
+                    "caption": review_photos[0]["caption"],
+                    "categories": review_photos[0]["categories"],
+                }
+            )
+        return review_state
+
+    batch_filenames_by_index: dict[int, str] = {}
     app = Flask(__name__)
 
     @app.get("/")
@@ -2214,7 +2912,15 @@ def run_app(image_path: Path) -> None:
 
     @app.get("/image")
     def image() -> tuple[bytes, int, dict[str, str]]:
-        return downsized_bytes, 200, {"Content-Type": mime_type}
+        photo = prepared_photos[0]
+        return photo.preview_bytes, 200, {"Content-Type": photo.preview_mime_type}
+
+    @app.get("/image/<int:photo_index>")
+    def group_image(photo_index: int) -> tuple[bytes, int, dict[str, str]]:
+        if photo_index < 0 or photo_index >= photo_count:
+            return b"Image not found", 404, {"Content-Type": "text/plain"}
+        photo = prepared_photos[photo_index]
+        return photo.preview_bytes, 200, {"Content-Type": photo.preview_mime_type}
 
     @app.post("/analyze")
     def analyze() -> tuple[Any, int]:
@@ -2229,57 +2935,179 @@ def run_app(image_path: Path) -> None:
     @app.post("/submit")
     def submit() -> tuple[Any, int]:
         payload = request.get_json(force=True)
-        filename_input = payload["filename"].strip()
-        stem = Path(filename_input).stem if filename_input else image_path.stem
-        filename = _preferred_filename(stem, "", upload_image_path.suffix)
-        caption = payload["caption"].strip()
-        categories = _dedupe_preserve_order(
-            [item.strip() for item in payload["categories"] if item.strip()]
-        )
-        description = build_description_wikitext(
-            caption=caption,
-            metadata=metadata,
-            author=commons_config.author,
-            license_wikitext=commons_config.license_wikitext,
-            categories=categories,
-        )
+        raw_photo_items = payload.get("photos")
+        if raw_photo_items is None and photo_count == 1:
+            raw_photo_items = [
+                {
+                    "index": 0,
+                    "filename": payload.get("filename", ""),
+                    "caption": payload.get("caption", ""),
+                    "categories": payload.get("categories", []),
+                    "nominate_quality_image": payload.get(
+                        "nominate_quality_image", False
+                    ),
+                }
+            ]
+        if not isinstance(raw_photo_items, list) or not raw_photo_items:
+            return jsonify({"error": "No photos were submitted for upload"}), 400
+
+        submitted_photos: list[dict[str, Any]] = []
+        submitted_indexes: set[int] = set()
         try:
-            if payload.get("nominate_quality_image"):
+            for raw_item in raw_photo_items:
+                if not isinstance(raw_item, dict):
+                    raise ValueError("Each submitted photo must be an object")
+                photo_index = int(raw_item.get("index", -1))
+                if photo_index < 0 or photo_index >= photo_count:
+                    raise ValueError(f"Invalid photo index: {photo_index}")
+                if photo_index in submitted_indexes:
+                    raise ValueError(f"Photo {photo_index + 1} was submitted twice")
+                submitted_indexes.add(photo_index)
+                prepared = prepared_photos[photo_index]
+                filename_input = str(raw_item.get("filename", "")).strip()
+                stem = (
+                    Path(filename_input).stem
+                    if filename_input
+                    else prepared.source_path.stem
+                )
+                filename = _preferred_filename(stem, "", prepared.upload_path.suffix)
+                raw_categories = raw_item.get("categories", [])
+                if not isinstance(raw_categories, list):
+                    raise ValueError(
+                        f"Categories for photo {photo_index + 1} must be a list"
+                    )
+                category_names: list[str] = []
+                for category_item in raw_categories:
+                    category = (
+                        str(category_item)
+                        .strip()
+                        .removeprefix("Category:")
+                        .strip()
+                    )
+                    if category:
+                        category_names.append(category)
+                submitted_photos.append(
+                    {
+                        "index": photo_index,
+                        "filename": filename,
+                        "caption": str(raw_item.get("caption", "")).strip(),
+                        "categories": _dedupe_preserve_order(category_names),
+                        "nominate_quality_image": bool(
+                            raw_item.get("nominate_quality_image")
+                        ),
+                    }
+                )
+        except (TypeError, ValueError) as exc:
+            return jsonify({"error": str(exc)}), 400
+
+        proposed_batch_filenames = dict(batch_filenames_by_index)
+        proposed_batch_filenames.update(
+            {item["index"]: item["filename"] for item in submitted_photos}
+        )
+        filename_keys = [
+            _commons_filename_key(filename)
+            for filename in proposed_batch_filenames.values()
+        ]
+        if len(set(filename_keys)) != len(filename_keys):
+            return jsonify({"error": "Every photo must have a unique filename"}), 400
+        batch_filenames_by_index.update(proposed_batch_filenames)
+        batch_filenames = [
+            filename
+            for _index, filename in sorted(batch_filenames_by_index.items())
+        ]
+
+        quality_image_count = sum(
+            bool(item["nominate_quality_image"]) for item in submitted_photos
+        )
+        uploaded_files: list[dict[str, Any]] = []
+        try:
+            if quality_image_count:
                 nominations_today = commons_api.quality_image_nomination_count(
                     commons_username, datetime.now(timezone.utc).date()
                 )
-                if nominations_today >= QUALITY_IMAGE_DAILY_NOMINATION_LIMIT:
+                if (
+                    nominations_today + quality_image_count
+                    > QUALITY_IMAGE_DAILY_NOMINATION_LIMIT
+                ):
                     return (
                         jsonify(
                             {
                                 "error": (
-                                    "Quality Image nomination limit reached: "
-                                    f"{nominations_today}/"
-                                    f"{QUALITY_IMAGE_DAILY_NOMINATION_LIMIT} "
-                                    "nominations are already listed for today UTC."
+                                    "Quality Image nomination limit would be exceeded: "
+                                    f"{nominations_today} already listed plus "
+                                    f"{quality_image_count} selected, with a daily limit "
+                                    f"of {QUALITY_IMAGE_DAILY_NOMINATION_LIMIT}."
                                 )
                             }
                         ),
                         400,
                     )
-            redirect_url = commons_api.upload_file(
-                image_path=upload_image_path,
-                filename=filename,
-                description_wikitext=description,
-                summary=f"Uploading {filename} via pupphoto",
-            )
-            if payload.get("nominate_quality_image"):
-                file_title = f"File:{filename}"
-                qi_description = _quality_image_description(caption, filename)
-                commons_api.nominate_quality_image(
-                    file_title=file_title,
-                    description=qi_description,
-                    username=commons_username,
+
+            for item in submitted_photos:
+                prepared = prepared_photos[item["index"]]
+                description = build_description_wikitext(
+                    caption=item["caption"],
+                    metadata=prepared.metadata,
+                    author=commons_config.author,
+                    license_wikitext=commons_config.license_wikitext,
+                    categories=item["categories"],
+                    batch_filenames=batch_filenames,
                 )
+                redirect_url = commons_api.upload_file(
+                    image_path=prepared.upload_path,
+                    filename=item["filename"],
+                    description_wikitext=description,
+                    summary=f"Uploading {item['filename']} via pupphoto",
+                )
+                uploaded_files.append(
+                    {
+                        "index": item["index"],
+                        "filename": item["filename"],
+                        "url": redirect_url,
+                    }
+                )
+                if item["nominate_quality_image"]:
+                    commons_api.nominate_quality_image(
+                        file_title=f"File:{item['filename']}",
+                        description=_quality_image_description(
+                            item["caption"], item["filename"]
+                        ),
+                        username=commons_username,
+                    )
         except Exception as exc:
-            return jsonify({"error": str(exc)}), 500
+            completed = len(uploaded_files)
+            prefix = ""
+            if completed:
+                completed_names = ", ".join(
+                    item["filename"] for item in uploaded_files
+                )
+                prefix = (
+                    f"Uploaded {completed} of {len(submitted_photos)} photos before "
+                    f"the batch stopped ({completed_names}). "
+                )
+            return (
+                jsonify(
+                    {
+                        "error": prefix + str(exc),
+                        "uploaded_files": uploaded_files,
+                    }
+                ),
+                500,
+            )
+
+        for photo in prepared_photos:
+            if photo.upload_temp_dir is not None:
+                photo.upload_temp_dir.cleanup()
         _schedule_exit()
-        return jsonify({"redirect_url": redirect_url}), 200
+        return (
+            jsonify(
+                {
+                    "redirect_url": uploaded_files[0]["url"],
+                    "uploaded_files": uploaded_files,
+                }
+            ),
+            200,
+        )
 
     @app.post("/overwrite")
     def overwrite() -> tuple[Any, int]:
@@ -2287,19 +3115,35 @@ def run_app(image_path: Path) -> None:
         title = payload.get("title", "").strip()
         if not title.startswith("File:"):
             return jsonify({"error": "Invalid file title"}), 400
-        valid_titles = {item["title"] for item in sha1_matches}
+        try:
+            photo_index = int(payload.get("photo_index", 0))
+        except (TypeError, ValueError):
+            return jsonify({"error": "Invalid photo index"}), 400
+        if photo_index < 0 or photo_index >= photo_count:
+            return jsonify({"error": "Invalid photo index"}), 400
+        prepared = prepared_photos[photo_index]
+        valid_titles = {item["title"] for item in prepared.sha1_matches}
         if title not in valid_titles:
             return jsonify({"error": "File is not in the matching SHA1 list"}), 400
         try:
             redirect_url = commons_api.overwrite_file(
-                image_path=upload_image_path,
+                image_path=prepared.upload_path,
                 title=title,
                 summary=f"Uploading new version of {title} via pupphoto",
             )
         except Exception as exc:
             return jsonify({"error": str(exc)}), 500
-        _schedule_exit()
-        return jsonify({"redirect_url": redirect_url}), 200
+        batch_filenames_by_index[photo_index] = title.removeprefix("File:")
+        if photo_count == 1:
+            if prepared.upload_temp_dir is not None:
+                prepared.upload_temp_dir.cleanup()
+            _schedule_exit()
+        return (
+            jsonify(
+                {"redirect_url": redirect_url, "photo_index": photo_index}
+            ),
+            200,
+        )
 
     port = _free_port(commons_config.ui_host)
     url = f"http://{commons_config.ui_host}:{port}/"
@@ -2311,11 +3155,19 @@ def run_app(image_path: Path) -> None:
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Review and upload a photo to Wikimedia Commons."
+        description=(
+            "Review and upload one photo or an ordered group of related photos to "
+            "Wikimedia Commons."
+        )
     )
-    parser.add_argument("image_path", type=Path)
+    parser.add_argument(
+        "image_paths",
+        type=Path,
+        nargs="+",
+        help="Photo paths; multiple paths are analyzed and uploaded as one group",
+    )
     args = parser.parse_args()
-    run_app(args.image_path)
+    run_app(args.image_paths)
 
 
 if __name__ == "__main__":
