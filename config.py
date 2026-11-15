@@ -1,9 +1,9 @@
 from __future__ import annotations
 
+import tomllib
 from dataclasses import asdict, dataclass, fields
 from pathlib import Path
 from typing import Any
-import tomllib
 
 
 def _expand_path(value: str, base_dir: Path) -> Path:
@@ -126,7 +126,7 @@ class OpenAIConfig:
         kwargs = _section_kwargs(cls, data)
         return cls(
             api_key=kwargs["api_key"],
-            vision_model=kwargs["vision_model"],
+            vision_model=kwargs.get("vision_model", "gpt-6.1-sol"),
             image_detail=kwargs["image_detail"],
             downsized_max_dimension=kwargs["downsized_max_dimension"],
         )

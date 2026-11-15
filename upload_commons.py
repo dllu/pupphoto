@@ -11,6 +11,7 @@ import re
 import shutil
 import socket
 import subprocess
+import sysconfig
 import tempfile
 import threading
 import time
@@ -18,17 +19,25 @@ import webbrowser
 from dataclasses import asdict, dataclass
 from datetime import date, datetime, timezone
 from fractions import Fraction
-from html import escape
-from io import BytesIO
 from functools import lru_cache
+from io import BytesIO
 from pathlib import Path
 from typing import Any
 
 import requests
 from flask import Flask, jsonify, request
+from jinja2 import Environment, FileSystemLoader, select_autoescape
 from openai import OpenAI
 from PIL import ExifTags, Image
 
+from commons_categories import (
+    _build_category_graph,
+    _category_intersection_query,
+    _dedupe_preserve_order,
+    _refine_category_intersections,
+    _remove_ancestor_duplicates,
+    _remove_empty_categories,
+)
 from config import CommonsConfig, OpenAIConfig, load_config
 from gps import is_in_banned_area
 from upload_photo import (
@@ -40,7 +49,6 @@ from upload_photo import (
     upload_temp_filename,
 )
 
-
 Image.MAX_IMAGE_PIXELS = None
 
 EXIF_TAGS = ExifTags.TAGS
@@ -51,8 +59,10 @@ RAW_SHA1_RE = re.compile(
 )
 MAX_CATEGORY_SEARCH_QUERIES = 8
 MAX_CATEGORY_RELATIONSHIP_QUERIES = 2
-MAX_CATEGORY_INTERSECTION_PAIRS = 1
-MAX_CATEGORY_INTERSECTION_RESULTS = 8
+DECISIONS_MODEL = "gpt-6-luna"
+CATEGORY_SELECTION_PROBABILITY_THRESHOLD = 0.5
+MAX_DECISIONS_IMAGES = 128
+MAX_DECISIONS_QUESTIONS = 400
 QUALITY_IMAGE_CANDIDATE_LIST_TITLE = "Commons:Quality images candidates/candidate list"
 QUALITY_IMAGE_DAILY_NOMINATION_LIMIT = 5
 GPS_EXIF_KEYS = tuple(
@@ -90,17 +100,6 @@ class PhotoMetadata:
             data["latitude"] = None
             data["longitude"] = None
         return data
-
-
-@dataclass
-class CategoryNode:
-    title: str
-    parents: list[str]
-    children: list[str]
-    query_hits: list[str]
-    source: str
-    file_count: int
-    subcategory_count: int
 
 
 @dataclass
@@ -909,22 +908,32 @@ class CommonsApi:
         result: dict[str, dict[str, Any]] = {}
         for batch_start in range(0, len(titles), self._TITLE_BATCH_SIZE):
             batch = titles[batch_start : batch_start + self._TITLE_BATCH_SIZE]
-            pages = self.get(
-                action="query",
-                titles="|".join(batch),
-                prop="categories|categoryinfo",
-                cllimit="max",
-                clshow="!hidden",
-            )["query"]["pages"]
-            for page in pages:
-                info = page.get("categoryinfo", {})
-                result[page["title"]] = {
-                    "parents": [
-                        category["title"] for category in page.get("categories", [])
-                    ],
-                    "file_count": int(info.get("files", 0)),
-                    "subcategory_count": int(info.get("subcats", 0)),
-                }
+            continuation: dict[str, Any] = {}
+            while True:
+                data = self.get(
+                    action="query",
+                    titles="|".join(batch),
+                    prop="categories|categoryinfo",
+                    cllimit="max",
+                    clshow="!hidden",
+                    **continuation,
+                )
+                for page in data["query"]["pages"]:
+                    details = result.setdefault(
+                        page["title"],
+                        {"parents": [], "file_count": 0, "subcategory_count": 0},
+                    )
+                    details["parents"] = _dedupe_preserve_order(
+                        details["parents"]
+                        + [category["title"] for category in page.get("categories", [])]
+                    )
+                    if "categoryinfo" in page:
+                        info = page["categoryinfo"]
+                        details["file_count"] = int(info.get("files", 0))
+                        details["subcategory_count"] = int(info.get("subcats", 0))
+                continuation = data.get("continue", {})
+                if not continuation:
+                    break
         return result
 
     def category_subcategories(
@@ -1057,16 +1066,19 @@ class CommonsApi:
         filename: str,
         token: str,
         comment: str,
-        ignorewarnings: str,
+        ignorewarnings: bool = False,
         text: str | None = None,
     ) -> dict[str, Any]:
         params: dict[str, Any] = {
             "action": "upload",
             "filename": filename,
             "comment": comment,
-            "ignorewarnings": ignorewarnings,
             "token": token,
         }
+        # MediaWiki treats any supplied boolean parameter as true, even "0".
+        # New uploads must omit this flag so filename collisions stop the upload.
+        if ignorewarnings:
+            params["ignorewarnings"] = "1"
         if text is not None:
             params["text"] = text
 
@@ -1107,10 +1119,14 @@ class CommonsApi:
             token=token,
             comment=summary,
             text=description_wikitext,
-            ignorewarnings="0",
         )
         upload = data["upload"]
         if upload["result"] != "Success":
+            if "exists" in upload.get("warnings", {}):
+                raise RuntimeError(
+                    f"Refusing to overwrite existing Commons file {filename}. "
+                    "Choose a different filename and submit again."
+                )
             raise RuntimeError(f"Commons upload failed: {upload}")
         return f"https://commons.wikimedia.org/wiki/File:{filename.replace(' ', '_')}"
 
@@ -1129,7 +1145,7 @@ class CommonsApi:
             filename=filename,
             token=token,
             comment=summary,
-            ignorewarnings="1",
+            ignorewarnings=True,
         )
         upload = data["upload"]
         if upload["result"] != "Success":
@@ -1141,6 +1157,21 @@ class VisionClient:
     def __init__(self, config: OpenAIConfig):
         self.config = config
         self.client = OpenAI(api_key=config.api_key)
+
+    def _ordered_image_content(self, image_data_urls: list[str]) -> list[dict[str, Any]]:
+        content: list[dict[str, Any]] = []
+        for index, image_data_url in enumerate(image_data_urls, start=1):
+            content.extend(
+                [
+                    {"type": "input_text", "text": f"Photo {index} of {len(image_data_urls)}:"},
+                    {
+                        "type": "input_image",
+                        "image_url": image_data_url,
+                        "detail": self.config.image_detail,
+                    },
+                ]
+            )
+        return content
 
     def propose_group_metadata(
         self,
@@ -1220,6 +1251,10 @@ class VisionClient:
             "mentioning the view, action, or detail that distinguishes each photo. Do not "
             "refer to photo numbers, 'this image', another photo, or an unsupported "
             "temporal sequence in a caption. "
+            "In each visual_summary, record the main subject's visible color, material, "
+            "body form, activity or state (such as parked versus moving), and setting "
+            "when clear. These observations support category discovery even when they "
+            "do not belong in the concise caption. "
             "Treat the optional user hint as high-priority factual context when it gives "
             "names, locations, dates, events, or the shooting viewpoint. Silently correct "
             "likely misspellings in the hint. "
@@ -1236,7 +1271,23 @@ class VisionClient:
             "when relevant. Generate no more than 8 queries total across search_queries "
             "and relationship_queries. Prioritize a standalone canonical-name query for "
             "each central identified subject, and use separate queries for useful "
-            "subject/place or subject/state combinations. Every query should contain a "
+            "subject/place or subject/state combinations. Cover independent useful "
+            "facets rather than spending the query budget on near-duplicate identity "
+            "queries. Search for visible color combined with manufacturer and body "
+            "form or object subtype, as well as color combined with location. Useful "
+            "titles can follow '<color> <manufacturer> <body form or objects>'; a "
+            "broad class such as sedans alone is less useful than that intersection. "
+            "Also search for visible color plus object class and location, and "
+            "activity or state plus object class and location, using plausible Commons "
+            "titles such as '<color> <objects> in <state or region>' and "
+            "'<activity/state> <objects> in <state or region>'. Use the general object "
+            "class when Commons is more likely to organize that facet by class than "
+            "by the specific model. Prefer a subject-specific place query such as "
+            "'<topic> in <city>' over a bare city name. A color or state query can use "
+            "a broader verified region if the city-specific intersection is unlikely "
+            "to exist. Reserve room for these facets whenever visibly supported; "
+            "do not let model names, years, or repeated place queries crowd them out. "
+            "Every query should contain a "
             "named subject, named place, model, operator, route, event, year, or similarly "
             "concrete context; do not output bare visual descriptors. Prefer exact proper "
             "names. Include a time-of-day query only when it is visually clear and useful. "
@@ -1265,20 +1316,7 @@ class VisionClient:
                 + (user_hint or "(none)"),
             }
         ]
-        for index, image_data_url in enumerate(image_data_urls):
-            user_content.extend(
-                [
-                    {
-                        "type": "input_text",
-                        "text": f"Photo {index + 1} of {photo_count}:",
-                    },
-                    {
-                        "type": "input_image",
-                        "image_url": image_data_url,
-                        "detail": self.config.image_detail,
-                    },
-                ]
-            )
+        user_content.extend(self._ordered_image_content(image_data_urls))
         response = self.client.responses.create(
             model=self.config.vision_model,
             reasoning={"effort": "low"},
@@ -1341,47 +1379,21 @@ class VisionClient:
         ):
             raise ValueError("Category inputs must describe the same photo group")
 
-        print("Requesting consistent category selections from OpenAI...", flush=True)
-        schema = {
-            "type": "object",
-            "properties": {
-                "photo_categories": {
-                    "type": "array",
-                    "items": {
-                        "type": "array",
-                        "items": {"type": "string"},
-                    },
-                    "minItems": photo_count,
-                    "maxItems": photo_count,
-                },
-                "reasoning_summary": {"type": "string"},
-            },
-            "required": ["photo_categories", "reasoning_summary"],
-            "additionalProperties": False,
-        }
-        instructions = (
-            f"You are selecting Wikimedia Commons topical categories for an ordered "
-            f"group of {photo_count} highly related photo(s). Return JSON only. Consider "
-            "all photos together, then return exactly one category array per photo in "
-            "input order. Choose only titles from the supplied candidate graph. Keep "
-            "category choices consistent across the group: use the same category for all "
-            "photos whenever it accurately applies, and vary only categories tied to a "
-            "visible difference in an individual photo. "
-            "Prefer the most specific applicable categories, especially titles combining "
-            "the depicted subject or scene type with the named place. Treat the user hint "
-            "as high-priority factual context. Each graph candidate includes file_count, "
-            "subcategory_count, and parent/child edges. In general, do not select a "
-            "zero-file category. Do not select both a category and its ancestor when the "
-            "child fully covers a photo. Avoid maintenance, creator, user, and campaign "
-            "categories. Do not add equipment or exposure categories; those are resolved "
-            "separately from each photo's EXIF. Choose only categories directly supported "
-            "by the individual photo, metadata, group context, or hint. Prefer specific "
-            "leaf categories for applicable places, operators, events, stations, vehicle "
-            "types, and years. Include a lighting or time-of-day category only when it is "
-            "visually clear in that photo. For station photos, a specific platform, "
-            "interior, roof, concourse, or train-service-at-station category is usually "
-            "better than a broad city, operator, or generic station category."
-        )
+        if photo_count > MAX_DECISIONS_IMAGES:
+            raise ValueError(
+                f"Decisions category selection supports at most {MAX_DECISIONS_IMAGES} "
+                "photos per group"
+            )
+        category_titles = [
+            title
+            for title, node in category_graph.get("nodes", {}).items()
+            if int(node.get("file_count", 0)) > 0
+        ]
+        photo_categories: list[list[str]] = [[] for _ in range(photo_count)]
+        if not category_titles:
+            return {"photo_categories": photo_categories, "reasoning_summary": ""}
+
+        print("Evaluating Commons categories with the OpenAI Decisions API...", flush=True)
         photo_context = [
             {
                 "photo_number": index + 1,
@@ -1406,40 +1418,237 @@ class VisionClient:
                 + json.dumps(category_graph, indent=2, sort_keys=True),
             }
         ]
-        for index, image_data_url in enumerate(image_data_urls):
-            user_content.extend(
-                [
+        user_content.extend(self._ordered_image_content(image_data_urls))
+        questions: list[dict[str, str]] = []
+        question_targets: dict[str, tuple[int, str]] = {}
+        for photo_index in range(photo_count):
+            for category_index, title in enumerate(category_titles):
+                name = f"photo_{photo_index + 1}_category_{category_index + 1}"
+                question_targets[name] = (photo_index, title)
+                questions.append(
                     {
-                        "type": "input_text",
-                        "text": f"Photo {index + 1} of {photo_count}:",
-                    },
-                    {
-                        "type": "input_image",
-                        "image_url": image_data_url,
-                        "detail": self.config.image_detail,
-                    },
-                ]
+                        "type": "predicate",
+                        "name": name,
+                        "instructions": (
+                            f"Is {json.dumps(title)} an appropriate Wikimedia Commons "
+                            f"topical category for photo {photo_index + 1}? Require "
+                            "support from this photo, its metadata, researched context, "
+                            "or the user hint. Treat the user hint as high-priority "
+                            "factual context. Use related photos as supporting context, "
+                            "but do not transfer visible features found only in another "
+                            "photo. Require direct relevance to a main depicted subject, "
+                            "activity, place, or clearly identifiable feature. Prefer "
+                            "specific categories in the graph. A bare city, state, "
+                            "country, or geographic-region category is not justified "
+                            "merely because it contains the "
+                            "shooting location; the named region or landform must itself "
+                            "be a depicted subject supported by the evidence. Unidentified "
+                            "distant hills do not establish a particular mountain range. "
+                            "For a subject-in-place category, a verified location of "
+                            "the depicted subject is sufficient; the place need not "
+                            "itself be a recognizable landscape. Color combined with "
+                            "manufacturer/body form, color combined with location, and "
+                            "activity or parked/moving state combined with location "
+                            "are useful independent facets when supported by the photo, "
+                            "even if its specific model identity is already known. "
+                            "Exclude maintenance, creator, user, campaign, "
+                            "equipment, and exposure categories. Include lighting or "
+                            "time-of-day categories only when visually clear in this "
+                            "photo. Assess applicability independently; redundant "
+                            "ancestor categories are removed separately."
+                        ),
+                    }
+                )
+        refused_count = 0
+        # Graph expansion and photo groups can exceed the per-request question
+        # limit. Keep the full shared context in every batch.
+        for start in range(0, len(questions), MAX_DECISIONS_QUESTIONS):
+            question_batch = questions[start : start + MAX_DECISIONS_QUESTIONS]
+            expected_names = {question["name"] for question in question_batch}
+            if len(questions) > MAX_DECISIONS_QUESTIONS:
+                print(
+                    f"Evaluating category questions {start + 1}-"
+                    f"{start + len(question_batch)} of {len(questions)}...",
+                    flush=True,
+                )
+            # The installed SDK has no Decisions resource yet. Its HTTP client keeps
+            # the existing API credentials, base URL, retries, and error handling.
+            decision = self.client.post(
+                "/decisions",
+                cast_to=dict[str, Any],
+                body={
+                    "model": DECISIONS_MODEL,
+                    "input": [{"role": "user", "content": user_content}],
+                    "questions": question_batch,
+                },
             )
+            answers = decision.get("answers", [])
+            if not isinstance(answers, list) or len(answers) != len(question_batch):
+                raise RuntimeError(
+                    "OpenAI Decisions returned an unexpected number of category answers"
+                )
+            seen_names: set[str] = set()
+            for answer in answers:
+                name = answer.get("name") if isinstance(answer, dict) else None
+                if (
+                    not isinstance(name, str)
+                    or name not in expected_names
+                    or name in seen_names
+                ):
+                    raise RuntimeError("OpenAI Decisions returned an unexpected category answer")
+                seen_names.add(name)
+                if answer.get("type") == "refusal":
+                    refused_count += 1
+                    continue
+                probability = answer.get("probability")
+                if (
+                    answer.get("type") != "predicate"
+                    or isinstance(probability, bool)
+                    or not isinstance(probability, (int, float))
+                    or not 0 <= probability <= 1
+                ):
+                    raise RuntimeError("OpenAI Decisions returned an invalid category probability")
+                photo_index, title = question_targets[name]
+                if probability >= CATEGORY_SELECTION_PROBABILITY_THRESHOLD:
+                    photo_categories[photo_index].append(title)
+        reasoning_summary = (
+            "Selected categories with applicability probability "
+            f">= {CATEGORY_SELECTION_PROBABILITY_THRESHOLD:g}."
+        )
+        if refused_count:
+            reasoning_summary += f" Skipped {refused_count} refused category question(s)."
+            print(reasoning_summary, flush=True)
+        return {
+            "photo_categories": photo_categories,
+            "reasoning_summary": reasoning_summary,
+        }
+
+    def review_group_categories(
+        self,
+        image_data_urls: list[str],
+        metadatas: list[PhotoMetadata],
+        proposed_photos: list[dict[str, str]],
+        photo_categories: list[list[str]],
+        group_summary: str,
+        research_summary: str,
+        category_graph: dict[str, Any],
+        user_hint: str,
+    ) -> dict[str, Any]:
+        """Review independently applicable categories as a coherent set per photo."""
+        photo_count = len(image_data_urls)
+        if not (
+            photo_count
+            and len(metadatas) == photo_count
+            and len(proposed_photos) == photo_count
+            and len(photo_categories) == photo_count
+        ):
+            raise ValueError("Category review inputs must describe the same photo group")
+        if not any(photo_categories):
+            return {"photo_categories": photo_categories, "reasoning_summary": ""}
+
+        print("Reviewing category specificity and redundancy across each photo...", flush=True)
+        schema = {
+            "type": "object",
+            "properties": {
+                "photos": {
+                    "type": "array",
+                    "minItems": photo_count,
+                    "maxItems": photo_count,
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "selected_categories": {
+                                "type": "array",
+                                "items": {"type": "string"},
+                            }
+                        },
+                        "required": ["selected_categories"],
+                        "additionalProperties": False,
+                    },
+                },
+                "reasoning_summary": {"type": "string"},
+            },
+            "required": ["photos", "reasoning_summary"],
+            "additionalProperties": False,
+        }
+        instructions = (
+            "Review Wikimedia Commons topical categories as a set for each photo. "
+            "These categories were scored independently for applicability; now remove "
+            "over-categorization and categories too broad to be useful. Return one "
+            "photos entry per input photo in the same order. Select only from that "
+            "photo's supplied categories; never invent a title or transfer a category "
+            "from another photo. Keep the most specific supported identity. Remove "
+            "generic object-class or body-form categories when they merely describe "
+            "the same main subject already covered by a specific named model or taxon. "
+            "The supplied category graph is incomplete: a missing ancestor path does "
+            "not establish that two categories provide independent information. Use "
+            "the photo and subject identity to recognize semantic redundancy too. "
+            "Keep independent, supported dimensions such as color, material, activity, "
+            "parked/moving state, and subject-in-place categories; a model or taxon "
+            "does not imply the depicted individual's color, activity, or location. "
+            "Prefer the most specific available intersection for each such dimension. "
+            "Do not collapse incomparable intersections across different axes: a "
+            "color/manufacturer/body-form category and a color/place category can "
+            "both be useful. A specific intersection replaces its broader class, "
+            "not other independent intersections. "
+            "Remove bare city, county, state, country, or geographic-region categories "
+            "when the place is only the shooting location for a close view of an "
+            "object. A topic-in-place category can be useful in that case. There is "
+            "no need to retain a city category if no useful subject-specific one was "
+            "found. Retain a place category when the place itself is a main depicted "
+            "subject, such as a recognizable cityscape or landscape. Do not remove "
+            "an independent category for a second main subject merely because it "
+            "overlaps the first subject's identity. Ignore incidental background "
+            "objects. Treat the user hint as factual context, and use each photo's "
+            "own visible evidence for its color, state, and depicted subjects."
+        )
+        context = {
+            "photos": [
+                {
+                    "photo_number": index + 1,
+                    "metadata": metadatas[index].to_model_dict(),
+                    **proposed_photos[index],
+                    "categories": categories,
+                }
+                for index, categories in enumerate(photo_categories)
+            ],
+            "group_summary": group_summary,
+            "research_summary": research_summary,
+            "user_hint": user_hint,
+            "category_parents": {
+                title: node.get("parents", [])
+                for title, node in category_graph.get("nodes", {}).items()
+            },
+        }
+        user_content: list[dict[str, Any]] = [
+            {"type": "input_text", "text": json.dumps(context, indent=2, sort_keys=True)}
+        ]
+        user_content.extend(self._ordered_image_content(image_data_urls))
         response = self.client.responses.create(
             model=self.config.vision_model,
             reasoning={"effort": "low"},
             input=[
-                {
-                    "role": "system",
-                    "content": [{"type": "input_text", "text": instructions}],
-                },
+                {"role": "system", "content": [{"type": "input_text", "text": instructions}]},
                 {"role": "user", "content": user_content},
             ],
-            text={"format": _json_schema("commons_group_category_selection", schema)},
+            text={"format": _json_schema("commons_group_category_review", schema)},
         )
-        selection = json.loads(response.output_text)
-        if len(selection.get("photo_categories", [])) != photo_count:
-            raise RuntimeError(
-                "OpenAI returned categories for a different number of photos "
-                f"({len(selection.get('photo_categories', []))} instead of "
-                f"{photo_count})"
-            )
-        return selection
+        review = json.loads(response.output_text)
+        reviewed_photos = review.get("photos")
+        if not isinstance(reviewed_photos, list) or len(reviewed_photos) != photo_count:
+            raise RuntimeError("OpenAI returned an unexpected number of category reviews")
+        reviewed_categories: list[list[str]] = []
+        for original, photo in zip(photo_categories, reviewed_photos):
+            retained = photo.get("selected_categories") if isinstance(photo, dict) else None
+            if not isinstance(retained, list) or any(
+                not isinstance(title, str) or title not in original for title in retained
+            ):
+                raise RuntimeError("OpenAI category review returned an unselected category")
+            reviewed_categories.append([title for title in original if title in retained])
+        return {
+            "photo_categories": reviewed_categories,
+            "reasoning_summary": review["reasoning_summary"],
+        }
 
     def choose_categories(
         self,
@@ -1528,12 +1737,7 @@ def _equipment_category_candidates(metadata: PhotoMetadata) -> list[str]:
 def _resolve_equipment_categories(
     commons_api: CommonsApi, metadata: PhotoMetadata
 ) -> list[str]:
-    categories: list[str] = []
-    print("Resolving equipment and exposure categories from EXIF...", flush=True)
-    for title in _equipment_category_candidates(metadata):
-        if commons_api.category_exists(title):
-            categories.append(title.removeprefix("Category:"))
-    return categories
+    return _resolve_group_equipment_categories(commons_api, [metadata])[0]
 
 
 def _resolve_group_equipment_categories(
@@ -1555,314 +1759,6 @@ def _resolve_group_equipment_categories(
         ]
         for candidates in candidates_by_photo
     ]
-
-
-def _dedupe_preserve_order(values: list[str]) -> list[str]:
-    seen: set[str] = set()
-    result: list[str] = []
-    for value in values:
-        if value not in seen:
-            seen.add(value)
-            result.append(value)
-    return result
-
-
-def _category_intersection_query(category_pairs: list[tuple[str, str]]) -> str:
-    def quoted_category(category: str) -> str:
-        value = category.removeprefix("Category:")
-        return value.replace("\\", "\\\\").replace('"', '\\"')
-
-    return " OR ".join(
-        f'incategory:"{quoted_category(left)}" incategory:"{quoted_category(right)}"'
-        for left, right in category_pairs
-    )
-
-
-def _category_title_supported_by_evidence(title: str, evidence: list[str]) -> bool:
-    normalized_title = " ".join(
-        re.findall(r"[^\W_]+", title.removeprefix("Category:").casefold())
-    )
-    normalized_evidence = " ".join(
-        re.findall(r"[^\W_]+", " ".join(evidence).casefold())
-    )
-    return bool(normalized_title) and normalized_title in normalized_evidence
-
-
-def _category_title_variants(query: str) -> list[str]:
-    base = re.sub(r"\s+", " ", query.removeprefix("Category:").strip())
-    if not base:
-        return []
-    variants = [
-        base,
-        base[:1].upper() + base[1:],
-    ]
-    return [f"Category:{variant}" for variant in _dedupe_preserve_order(variants)]
-
-
-def _add_category_node(
-    nodes: dict[str, CategoryNode],
-    title: str,
-    source: str,
-    query_hit: str | None = None,
-) -> CategoryNode:
-    node = nodes.get(title)
-    if node is None:
-        node = CategoryNode(
-            title=title,
-            parents=[],
-            children=[],
-            query_hits=[],
-            source=source,
-            file_count=0,
-            subcategory_count=0,
-        )
-        nodes[title] = node
-    elif source not in node.source.split("+"):
-        node.source = f"{node.source}+{source}"
-    if query_hit:
-        node.query_hits.append(query_hit)
-    return node
-
-
-def _build_category_graph(
-    commons_api: CommonsApi,
-    queries: list[str],
-    limit_per_query: int,
-    max_candidate_categories: int,
-    max_parent_depth: int,
-) -> dict[str, Any]:
-    print("Building candidate Commons category graph...", flush=True)
-    seed_nodes: dict[str, CategoryNode] = {}
-    exact_query_hits_by_title: dict[str, list[str]] = {}
-    for query in _dedupe_preserve_order(queries):
-        for title in commons_api.search_categories(query, limit_per_query):
-            _add_category_node(seed_nodes, title, "search", query)
-        for title in _category_title_variants(query):
-            exact_query_hits_by_title.setdefault(title, []).append(query)
-
-    exact_candidate_titles = _dedupe_preserve_order(list(exact_query_hits_by_title))
-    for title in commons_api.existing_category_titles(exact_candidate_titles):
-        for query in exact_query_hits_by_title.get(title, []):
-            _add_category_node(seed_nodes, title, "exact", query)
-
-    exact_titles = [
-        title for title, node in seed_nodes.items() if "exact" in node.source.split("+")
-    ]
-    exact_title_set = set(exact_titles)
-    other_titles = [title for title in seed_nodes if title not in exact_title_set]
-    limited_titles = (exact_titles + other_titles)[:max_candidate_categories]
-    if len(seed_nodes) > len(limited_titles):
-        limited_set = set(limited_titles)
-        dropped = [title for title in seed_nodes if title not in limited_set]
-        print(
-            "Dropping candidate categories due to max_candidate_categories: "
-            + json.dumps(dropped, ensure_ascii=True),
-            flush=True,
-        )
-    graph_nodes: dict[str, CategoryNode] = {
-        title: seed_nodes[title] for title in limited_titles
-    }
-    frontier = list(graph_nodes)
-    detailed_titles: set[str] = set()
-    child_lookup_count = 0
-    depth = 0
-    while frontier and depth < max_parent_depth:
-        details_map = commons_api.category_details(frontier)
-        child_lookup_titles: list[str] = []
-        for title in frontier:
-            if child_lookup_count >= commons_api._MAX_CHILD_CATEGORY_LOOKUPS:
-                break
-            node = graph_nodes[title]
-            if depth == 0 or "exact" in node.source.split("+"):
-                child_lookup_titles.append(title)
-                child_lookup_count += 1
-        child_map = commons_api.category_subcategories(
-            child_lookup_titles, max(limit_per_query, 1)
-        )
-        next_frontier: list[str] = []
-        for title in frontier:
-            details = details_map.get(title, {})
-            parents = details.get("parents", [])
-            children = child_map.get(title, [])
-            graph_nodes[title].parents = _dedupe_preserve_order(
-                graph_nodes[title].parents + parents
-            )
-            graph_nodes[title].children = _dedupe_preserve_order(
-                graph_nodes[title].children + children
-            )
-            graph_nodes[title].file_count = int(details.get("file_count", 0))
-            graph_nodes[title].subcategory_count = int(
-                details.get("subcategory_count", 0)
-            )
-            detailed_titles.add(title)
-            for parent in parents:
-                if parent not in graph_nodes:
-                    _add_category_node(graph_nodes, parent, "ancestor")
-                    if parent not in next_frontier:
-                        next_frontier.append(parent)
-            for child in children:
-                child_node = _add_category_node(graph_nodes, child, "child")
-                child_node.parents = _dedupe_preserve_order(
-                    child_node.parents + [title]
-                )
-                if child not in detailed_titles and child not in next_frontier:
-                    next_frontier.append(child)
-        frontier = next_frontier
-        depth += 1
-    remaining_titles = [title for title in graph_nodes if title not in detailed_titles]
-    counts_map = commons_api.category_counts(remaining_titles)
-    for title, node in graph_nodes.items():
-        counts = counts_map.get(title, {})
-        if counts:
-            node.file_count = int(counts.get("file_count", 0))
-            node.subcategory_count = int(counts.get("subcategory_count", 0))
-    return {
-        "nodes": {
-            title: {
-                "parents": node.parents,
-                "children": node.children,
-                "query_hits": _dedupe_preserve_order(node.query_hits),
-                "source": node.source,
-                "file_count": node.file_count,
-                "subcategory_count": node.subcategory_count,
-            }
-            for title, node in sorted(graph_nodes.items())
-        }
-    }
-
-
-def _remove_ancestor_duplicates(
-    selected_categories: list[str], graph: dict[str, Any]
-) -> list[str]:
-    node_map = graph.get("nodes", {})
-
-    def ancestors_of(title: str) -> set[str]:
-        stack = list(node_map.get(f"Category:{title}", {}).get("parents", []))
-        seen: set[str] = set()
-        while stack:
-            parent = stack.pop()
-            if parent in seen:
-                continue
-            seen.add(parent)
-            stack.extend(node_map.get(parent, {}).get("parents", []))
-        return {item.removeprefix("Category:") for item in seen}
-
-    selected_ancestors: set[str] = set()
-    for category in selected_categories:
-        selected_ancestors.update(ancestors_of(category))
-    return [
-        category
-        for category in selected_categories
-        if category not in selected_ancestors
-    ]
-
-
-def _remove_empty_categories(
-    selected_categories: list[str], graph: dict[str, Any]
-) -> list[str]:
-    node_map = graph.get("nodes", {})
-    filtered: list[str] = []
-    removed: list[str] = []
-    for category in selected_categories:
-        node = node_map.get(f"Category:{category}", {})
-        if int(node.get("file_count", 0)) <= 0:
-            removed.append(category)
-            continue
-        filtered.append(category)
-    if removed:
-        print(
-            "Dropping zero-file topical categories: "
-            + json.dumps(removed, ensure_ascii=True),
-            flush=True,
-        )
-    return filtered
-
-
-def _refine_category_intersections(
-    commons_api: CommonsApi,
-    selected_categories: list[str],
-    graph: dict[str, Any],
-    evidence: list[str],
-    intersection_cache: (
-        dict[tuple[tuple[str, str], ...], dict[str, dict[str, Any]]] | None
-    ) = None,
-) -> list[str]:
-    if len(selected_categories) < 2:
-        return selected_categories
-
-    graph_nodes = graph.setdefault("nodes", {})
-    ranked_pairs: list[tuple[int, int, int, tuple[str, str]]] = []
-    pair_index = 0
-    for left_index, left in enumerate(selected_categories):
-        for right in selected_categories[left_index + 1 :]:
-            left_title = f"Category:{left}"
-            right_title = f"Category:{right}"
-            left_parents = set(graph_nodes.get(left_title, {}).get("parents", []))
-            right_parents = set(graph_nodes.get(right_title, {}).get("parents", []))
-            left_tokens = set(re.findall(r"[^\W_]+", left.casefold()))
-            right_tokens = set(re.findall(r"[^\W_]+", right.casefold()))
-            ranked_pairs.append(
-                (
-                    len(left_parents.intersection(right_parents)),
-                    len(left_tokens.intersection(right_tokens)),
-                    -pair_index,
-                    (left, right),
-                )
-            )
-            pair_index += 1
-    ranked_pairs.sort(reverse=True)
-    category_pairs = [
-        pair for _, _, _, pair in ranked_pairs[:MAX_CATEGORY_INTERSECTION_PAIRS]
-    ]
-
-    cache_key = tuple(category_pairs)
-    if intersection_cache is not None and cache_key in intersection_cache:
-        intersection_details = intersection_cache[cache_key]
-    else:
-        intersection_details = commons_api.search_category_intersections(
-            category_pairs,
-            MAX_CATEGORY_INTERSECTION_RESULTS,
-        )
-        if intersection_cache is not None:
-            intersection_cache[cache_key] = intersection_details
-    selected_titles = {f"Category:{category}" for category in selected_categories}
-    refinements: list[str] = []
-    for title, details in intersection_details.items():
-        parents = _dedupe_preserve_order(details.get("parents", []))
-        selected_parents = selected_titles.intersection(parents)
-        if len(selected_parents) < 2:
-            continue
-        if int(details.get("file_count", 0)) <= 0:
-            continue
-        if not _category_title_supported_by_evidence(title, evidence):
-            continue
-        graph_nodes[title] = {
-            "parents": parents,
-            "children": [],
-            "query_hits": [],
-            "source": "intersection",
-            "file_count": int(details.get("file_count", 0)),
-            "subcategory_count": int(details.get("subcategory_count", 0)),
-        }
-        for parent in parents:
-            parent_node = graph_nodes.get(parent)
-            if parent_node is not None:
-                parent_node["children"] = _dedupe_preserve_order(
-                    parent_node.get("children", []) + [title]
-                )
-        refinements.append(title.removeprefix("Category:"))
-
-    if not refinements:
-        return selected_categories
-    print(
-        "Refining selected categories with shared child categories: "
-        + json.dumps(refinements, ensure_ascii=True),
-        flush=True,
-    )
-    return _remove_ancestor_duplicates(
-        _dedupe_preserve_order(selected_categories + refinements),
-        graph,
-    )
 
 
 def _wikitext_categories(categories: list[str]) -> str:
@@ -1946,6 +1842,21 @@ def _free_port(host: str) -> int:
         return sock.getsockname()[1]
 
 
+def _review_static_dir() -> Path:
+    source_dir = Path(__file__).with_name("static")
+    if (source_dir / "commons_upload.html").is_file():
+        return source_dir
+    return Path(sysconfig.get_path("data")) / "share" / "pupphoto" / "static"
+
+
+@lru_cache(maxsize=1)
+def _review_templates() -> Environment:
+    return Environment(
+        loader=FileSystemLoader(_review_static_dir()),
+        autoescape=select_autoescape(["html"]),
+    )
+
+
 def _html_page(state: dict[str, Any]) -> str:
     photos = state.get("photos")
     if not isinstance(photos, list) or not photos:
@@ -1958,611 +1869,15 @@ def _html_page(state: dict[str, Any]) -> str:
                 "sha1_matches": state.get("sha1_matches", []),
             }
         ]
-    photo_count = len(photos)
-
-    warning_banners: list[str] = []
-    preview_cards: list[str] = []
-    for position, photo in enumerate(photos):
-        photo_index = int(photo.get("index", position))
-        source_name = str(photo.get("source_name") or f"Photo {position + 1}")
-        matches = photo.get("sha1_matches", [])
-        if matches:
-            sha1_line = ""
-            if photo.get("raw_sha1sum"):
-                sha1_line = (
-                    f'<p><code>{escape(str(photo["raw_sha1sum"]))}</code></p>'
-                )
-            match_items = "".join(
-                f'<li><a href="{escape(str(item["url"]), quote=True)}" '
-                f'target="_blank" rel="noreferrer">{escape(str(item["title"]))}</a>'
-                f'<button type="button" class="overwrite-btn" '
-                f'data-photo-index="{photo_index}" '
-                f'data-file-title="{escape(str(item["title"]), quote=True)}">'
-                "Overwrite this file</button></li>"
-                for item in matches
-            )
-            label = f"Photo {position + 1}" if photo_count > 1 else "This photo"
-            warning_banners.append(
-                '<div class="warning-banner">'
-                f"<h2>Possible Existing Upload: {escape(label)}</h2>"
-                "<p>Its raw SHA1 sum was found on Commons. Continue if this is "
-                "intentionally different, or overwrite an existing file if this is a "
-                "minor improved version.</p>"
-                + sha1_line
-                + "<ul>"
-                + match_items
-                + "</ul></div>"
-            )
-
-        preview_label = f"Photo {position + 1}" if photo_count > 1 else "Photo"
-        preview_cards.append(
-            '<section class="card image-card">'
-            f'<div class="photo-label"><strong>{escape(preview_label)}</strong>'
-            f"<span>{escape(source_name)}</span></div>"
-            f'<img src="/image/{photo_index}" alt="Upload preview {position + 1}">'
-            "<details class=\"meta\"><summary>Metadata</summary><pre>"
-            + escape(json.dumps(photo.get("metadata", {}), indent=2, sort_keys=True))
-            + "</pre></details></section>"
-        )
-    warning_banner = "".join(warning_banners)
-    preview_html = "".join(preview_cards)
     qi_count = int(state.get("quality_image_nominations_today", 0))
     qi_limit = int(state.get("quality_image_nomination_limit", 5))
-    qi_date = str(state.get("quality_image_nomination_date", "today"))
-    qi_warning = ""
-    if qi_count >= qi_limit:
-        qi_warning = (
-            '<p class="inline-warning">'
-            f"{escape(str(qi_count))}/{escape(str(qi_limit))} Quality Image "
-            f"nominations already listed for {escape(qi_date)} UTC."
-            "</p>"
-        )
-    qi_disabled = "true" if qi_count >= qi_limit else "false"
-    upload_label = "Save and upload" if photo_count == 1 else f"Upload {photo_count} photos"
-    prepare_heading = (
-        "Prepare Commons Upload"
-        if photo_count == 1
-        else f"Prepare {photo_count}-Photo Commons Group"
+    return _review_templates().get_template("commons_upload.html").render(
+        photos=photos,
+        qi_count=qi_count,
+        qi_limit=qi_limit,
+        qi_date=state.get("quality_image_nomination_date", "today"),
+        qi_disabled=qi_count >= qi_limit,
     )
-    return f"""<!doctype html>
-<html lang="en">
-<head>
-  <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>Commons Upload Review</title>
-  <style>
-    :root {{
-      color-scheme: light;
-      --bg: #f5f2ea;
-      --panel: #fffaf0;
-      --ink: #181510;
-      --accent: #8e3b1b;
-      --line: #d8ccb8;
-    }}
-    body {{
-      margin: 0;
-      font-family: Georgia, "Iowan Old Style", serif;
-      background: var(--bg);
-      color: var(--ink);
-    }}
-    .page {{
-      max-width: 1320px;
-      margin: 0 auto;
-      padding: 24px;
-      display: grid;
-      gap: 24px;
-      grid-template-columns: minmax(320px, 1fr) minmax(420px, 560px);
-      align-items: start;
-    }}
-    .photo-stack {{
-      display: grid;
-      gap: 24px;
-    }}
-    .card {{
-      background: rgba(255,250,240,.92);
-      border: 1px solid var(--line);
-      border-radius: 18px;
-      box-shadow: 0 10px 30px rgba(70,50,30,.08);
-      overflow: hidden;
-    }}
-    .image-card img {{
-      display: block;
-      width: 100%;
-      height: auto;
-      background: #ddd4c5;
-    }}
-    .photo-label {{
-      padding: 13px 18px;
-      display: flex;
-      justify-content: space-between;
-      gap: 12px;
-      border-bottom: 1px solid var(--line);
-      font-size: 14px;
-      overflow-wrap: anywhere;
-    }}
-    .photo-label span {{
-      color: #6b5745;
-      text-align: right;
-    }}
-    .meta {{
-      padding: 18px 20px;
-      font-size: 14px;
-      line-height: 1.5;
-      border-top: 1px solid var(--line);
-    }}
-    .meta summary {{
-      cursor: pointer;
-      font-weight: 700;
-    }}
-    .meta pre {{
-      overflow-x: auto;
-      white-space: pre-wrap;
-      overflow-wrap: anywhere;
-    }}
-    .form-card {{
-      padding: 20px;
-      position: sticky;
-      top: 24px;
-      max-height: calc(100vh - 48px);
-      overflow-y: auto;
-    }}
-    .warning-banner {{
-      margin: 0 0 18px;
-      padding: 14px 16px;
-      border: 1px solid #d5b16d;
-      border-radius: 14px;
-      background: #fff1cf;
-      color: #5d3d0c;
-    }}
-    .warning-banner h2 {{
-      margin: 0 0 8px;
-      font-size: 18px;
-      line-height: 1.2;
-    }}
-    .warning-banner p {{
-      margin: 0 0 10px;
-      font-size: 14px;
-      line-height: 1.45;
-    }}
-    .warning-banner ul {{
-      margin: 0;
-      padding-left: 18px;
-    }}
-    .warning-banner li {{
-      display: flex;
-      gap: 10px;
-      align-items: center;
-      justify-content: space-between;
-      flex-wrap: wrap;
-    }}
-    .warning-banner li + li {{
-      margin-top: 6px;
-    }}
-    .warning-banner a {{
-      color: inherit;
-    }}
-    .warning-banner code {{
-      font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
-      font-size: 13px;
-    }}
-    .warning-banner .overwrite-btn {{
-      padding: 8px 12px;
-      background: #eadfcd;
-      color: #3d2d20;
-      white-space: nowrap;
-    }}
-    h1 {{
-      margin: 0 0 16px;
-      font-size: 28px;
-      line-height: 1.1;
-    }}
-    h2 {{
-      margin: 0 0 8px;
-      font-size: 21px;
-    }}
-    label {{
-      display: block;
-      margin: 16px 0 8px;
-      font-weight: 700;
-    }}
-    input[type="text"], textarea {{
-      width: 100%;
-      box-sizing: border-box;
-      padding: 12px 14px;
-      border: 1px solid #b9ab92;
-      border-radius: 10px;
-      background: #fff;
-      font: inherit;
-      color: inherit;
-    }}
-    textarea {{
-      min-height: 96px;
-      resize: vertical;
-    }}
-    .category-row {{
-      display: grid;
-      grid-template-columns: 1fr auto;
-      gap: 8px;
-      margin-bottom: 8px;
-    }}
-    .photo-editor {{
-      margin-top: 22px;
-      padding-top: 20px;
-      border-top: 1px solid var(--line);
-    }}
-    .photo-editor:first-child {{
-      margin-top: 16px;
-    }}
-    .photo-editor.skipped {{
-      display: none;
-    }}
-    button {{
-      border: 0;
-      border-radius: 999px;
-      padding: 11px 16px;
-      font: inherit;
-      cursor: pointer;
-    }}
-    .primary {{
-      background: var(--accent);
-      color: #fff;
-      font-weight: 700;
-    }}
-    .secondary {{
-      background: #eadfcd;
-      color: #3d2d20;
-    }}
-    .actions {{
-      display: flex;
-      gap: 10px;
-      margin-top: 18px;
-      align-items: center;
-      flex-wrap: wrap;
-    }}
-    .checkbox-row {{
-      display: flex;
-      gap: 10px;
-      align-items: flex-start;
-      margin-top: 16px;
-      font-weight: 700;
-    }}
-    .checkbox-row input {{
-      margin-top: 4px;
-    }}
-    .inline-note, .inline-warning {{
-      margin: 8px 0 0 28px;
-      font-size: 14px;
-      line-height: 1.4;
-      color: #5f4635;
-    }}
-    .inline-warning {{
-      color: #8e3b1b;
-      font-weight: 700;
-    }}
-    .group-note {{
-      color: #5f4635;
-      line-height: 1.45;
-    }}
-    .completion-list {{
-      padding-left: 20px;
-    }}
-    .completion-list li + li {{
-      margin-top: 8px;
-    }}
-    .spinner {{
-      width: 18px;
-      height: 18px;
-      border: 3px solid rgba(142,59,27,.2);
-      border-top-color: var(--accent);
-      border-radius: 50%;
-      display: none;
-      animation: spin 0.8s linear infinite;
-    }}
-    .spinner.visible {{
-      display: inline-block;
-    }}
-    .status {{
-      min-height: 1.2em;
-      font-size: 14px;
-      color: #5f4635;
-      overflow-wrap: anywhere;
-    }}
-    .status.error {{
-      width: 100%;
-      padding: 10px 12px;
-      border: 1px solid var(--line);
-      border-radius: 10px;
-      background: #f8efe4;
-      white-space: pre-wrap;
-      font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
-    }}
-    @keyframes spin {{
-      to {{ transform: rotate(360deg); }}
-    }}
-    @media (max-width: 900px) {{
-      .page {{
-        grid-template-columns: 1fr;
-      }}
-      .form-card {{
-        position: static;
-        max-height: none;
-      }}
-    }}
-  </style>
-</head>
-<body>
-  <div class="page">
-    <div class="photo-stack">{preview_html}</div>
-    <section class="card form-card">
-      <div id="hint-stage">
-        <h1>{escape(prepare_heading)}</h1>
-        {warning_banner}
-        <p>Add one optional hint for the whole group. The model will inspect all photos together, then propose consistent captions, categories, and ordered filenames.</p>
-        <label for="hint">Hint</label>
-        <textarea id="hint" placeholder="Optional: identify the shared subject, place, event, viewpoint, or other context."></textarea>
-        <div class="actions">
-          <button type="button" class="primary" id="analyze">Generate proposal</button>
-        </div>
-      </div>
-      <div id="review-stage" style="display:none">
-        <h1>Review Commons Upload</h1>
-        <label for="review-hint">Hint</label>
-        <textarea id="review-hint" placeholder="Optional hint for re-analysis."></textarea>
-        <div class="actions">
-          <button type="button" class="secondary" id="redo">Redo with hint</button>
-        </div>
-        <p class="group-note">The topical categories were selected using the whole group. Filename numbers follow the command-line order. Equipment and exposure categories were resolved separately for each photo.</p>
-        <div id="photo-fields"></div>
-        <p class="inline-note">{escape(str(qi_count))}/{escape(str(qi_limit))} Quality Image nominations listed for {escape(qi_date)} UTC.</p>
-        {qi_warning}
-        <div class="actions">
-          <button type="button" class="primary" id="submit">{escape(upload_label)}</button>
-        </div>
-      </div>
-      <div class="actions">
-        <div class="spinner" id="spinner"></div>
-        <div class="status" id="status"></div>
-      </div>
-    </section>
-  </div>
-  <script>
-    const photoCount = {photo_count};
-    const qualityImageDisabled = {qi_disabled};
-    const skippedPhotoIndexes = new Set();
-    const completedUploads = new Map();
-    const photoFields = document.getElementById("photo-fields");
-    const spinner = document.getElementById("spinner");
-    const status = document.getElementById("status");
-    const hintStage = document.getElementById("hint-stage");
-    const reviewStage = document.getElementById("review-stage");
-    function addCategory(container, value = "") {{
-      const row = document.createElement("div");
-      row.className = "category-row";
-      row.innerHTML = '<input type="text" class="category-input"><button type="button" class="remove-btn">Remove</button>';
-      row.querySelector(".category-input").value = value;
-      row.querySelector(".remove-btn").onclick = () => row.remove();
-      container.appendChild(row);
-    }}
-
-    function buildPhotoEditor(photo, position) {{
-      const editor = document.createElement("section");
-      editor.className = "photo-editor";
-      editor.dataset.photoIndex = String(photo.index);
-      const heading = photoCount > 1 ? `Photo ${{position + 1}}` : "Photo";
-      editor.innerHTML = `
-        <h2>${{heading}}</h2>
-        <label>Filename</label>
-        <input type="text" class="filename-input">
-        <label>Caption</label>
-        <textarea class="caption-input"></textarea>
-        <label>Categories</label>
-        <div class="photo-categories"></div>
-        <button type="button" class="secondary add-category">Add category</button>
-        <label class="checkbox-row">
-          <input type="checkbox" class="quality-image-input">
-          <span>Nominate as Quality Image</span>
-        </label>`;
-      editor.querySelector(".filename-input").value = photo.filename;
-      editor.querySelector(".caption-input").value = photo.caption;
-      const categoryContainer = editor.querySelector(".photo-categories");
-      photo.categories.forEach((category) => addCategory(categoryContainer, category));
-      editor.querySelector(".add-category").onclick = () =>
-        addCategory(categoryContainer, "");
-      editor.querySelector(".quality-image-input").disabled = qualityImageDisabled;
-      if (skippedPhotoIndexes.has(Number(photo.index))) {{
-        editor.classList.add("skipped");
-      }}
-      return editor;
-    }}
-
-    document.querySelectorAll(".overwrite-btn").forEach((button) => {{
-      button.onclick = async () => {{
-        const title = button.dataset.fileTitle;
-        const photoIndex = Number(button.dataset.photoIndex);
-        setBusy(`Overwriting ${{title}}...`);
-        try {{
-          const data = await postJson("/overwrite", {{ title, photo_index: photoIndex }}, "overwrite");
-          if (photoCount === 1) {{
-            clearBusy("Overwrite complete. Redirecting...");
-            window.location.href = data.redirect_url;
-            return;
-          }}
-          skippedPhotoIndexes.add(photoIndex);
-          button.disabled = true;
-          button.textContent = "Overwritten; omitted from batch";
-          const editor = document.querySelector(
-            `.photo-editor[data-photo-index="${{photoIndex}}"]`
-          );
-          if (editor) editor.classList.add("skipped");
-          window.open(data.redirect_url, "_blank", "noopener");
-          clearBusy("Overwrite complete. That photo will be omitted from the new uploads.");
-        }} catch (error) {{
-          clearBusy(error.message || "Overwrite failed", true);
-          return;
-        }}
-      }};
-    }});
-    function setBusy(message) {{
-      spinner.classList.add("visible");
-      status.classList.remove("error");
-      status.textContent = message;
-    }}
-    function clearBusy(message = "", isError = false) {{
-      spinner.classList.remove("visible");
-      status.classList.toggle("error", isError);
-      status.textContent = message;
-    }}
-    function serverUnavailableMessage(action) {{
-      return (
-        "The local upload server is no longer responding while trying to " +
-        action +
-        ". Restart upload_commons.py and reload this page to continue."
-      );
-    }}
-    async function postJson(path, payload, action) {{
-      let response;
-      try {{
-        response = await fetch(path, {{
-          method: "POST",
-          headers: {{ "Content-Type": "application/json" }},
-          body: JSON.stringify(payload),
-        }});
-      }} catch (error) {{
-        throw new Error(serverUnavailableMessage(action));
-      }}
-
-      let data;
-      try {{
-        data = await response.json();
-      }} catch (error) {{
-        if (!response.ok) {{
-          throw new Error(
-            action.charAt(0).toUpperCase() +
-              action.slice(1) +
-              " failed: HTTP " +
-              response.status
-          );
-        }}
-        throw new Error(
-          "The local upload server returned an invalid response while trying to " +
-            action +
-            "."
-        );
-      }}
-
-      if (!response.ok) {{
-        const requestError = new Error(
-          data.error || action.charAt(0).toUpperCase() + action.slice(1) + " failed"
-        );
-        requestError.responseData = data;
-        throw requestError;
-      }}
-      return data;
-    }}
-    function populateReview(data) {{
-      document.getElementById("review-hint").value = data.hint || "";
-      const proposedPhotos = data.photos || [{{
-        index: 0,
-        filename: data.filename,
-        caption: data.caption,
-        categories: data.categories,
-      }}];
-      photoFields.innerHTML = "";
-      proposedPhotos.forEach((photo, position) =>
-        photoFields.appendChild(buildPhotoEditor(photo, position))
-      );
-      hintStage.style.display = "none";
-      reviewStage.style.display = "block";
-    }}
-    async function analyzeWithHint(hintValue) {{
-      setBusy("Generating proposal...");
-      let data;
-      try {{
-        data = await postJson("/analyze", {{ hint: hintValue }}, "generate a proposal");
-      }} catch (error) {{
-        clearBusy(error.message || "Analysis failed", true);
-        return null;
-      }}
-      populateReview(data);
-      clearBusy("Proposal ready.");
-      return data;
-    }}
-    document.getElementById("analyze").onclick = async () => {{
-      const hintValue = document.getElementById("hint").value.trim();
-      await analyzeWithHint(hintValue);
-    }};
-    document.getElementById("redo").onclick = async () => {{
-      const hintValue = document.getElementById("review-hint").value.trim();
-      await analyzeWithHint(hintValue);
-    }};
-    document.getElementById("submit").onclick = async () => {{
-      const photos = Array.from(document.querySelectorAll(".photo-editor"))
-        .filter((editor) => !skippedPhotoIndexes.has(Number(editor.dataset.photoIndex)))
-        .map((editor) => ({{
-          index: Number(editor.dataset.photoIndex),
-          filename: editor.querySelector(".filename-input").value,
-          caption: editor.querySelector(".caption-input").value,
-          categories: Array.from(editor.querySelectorAll(".category-input"))
-            .map((node) => node.value.trim())
-            .filter(Boolean),
-          nominate_quality_image: editor.querySelector(".quality-image-input").checked,
-        }}));
-      if (!photos.length) {{
-        clearBusy("There are no photos left to upload in this session.", true);
-        return;
-      }}
-      setBusy(photos.length === 1 ? "Uploading..." : `Uploading ${{photos.length}} photos...`);
-      const payload = {{
-        photos,
-      }};
-      try {{
-        const data = await postJson("/submit", payload, "upload");
-        data.uploaded_files.forEach((file) => completedUploads.set(file.index, file));
-        const allUploadedFiles = Array.from(completedUploads.values())
-          .sort((left, right) => left.index - right.index);
-        if (photoCount === 1) {{
-          clearBusy("Upload complete. Redirecting...");
-          window.location.href = data.redirect_url;
-          return;
-        }}
-        reviewStage.innerHTML = "<h1>Upload complete</h1>";
-        const message = document.createElement("p");
-        message.textContent = `${{allUploadedFiles.length}} photos uploaded successfully.`;
-        reviewStage.appendChild(message);
-        const list = document.createElement("ol");
-        list.className = "completion-list";
-        allUploadedFiles.forEach((file) => {{
-          const item = document.createElement("li");
-          const link = document.createElement("a");
-          link.href = file.url;
-          link.textContent = file.filename;
-          link.target = "_blank";
-          link.rel = "noreferrer";
-          item.appendChild(link);
-          list.appendChild(item);
-        }});
-        reviewStage.appendChild(list);
-        clearBusy("Batch upload complete.");
-      }} catch (error) {{
-        const uploadedBeforeError = error.responseData?.uploaded_files || [];
-        uploadedBeforeError.forEach((file) => {{
-          completedUploads.set(file.index, file);
-          skippedPhotoIndexes.add(file.index);
-          const editor = document.querySelector(
-            `.photo-editor[data-photo-index="${{file.index}}"]`
-          );
-          if (editor) editor.classList.add("skipped");
-        }});
-        const retryNote = uploadedBeforeError.length
-          ? " Successfully uploaded items were hidden; after addressing the error, retry to upload only the remaining items."
-          : "";
-        clearBusy((error.message || "Upload failed") + retryNote, true);
-        return;
-      }}
-    }};
-  </script>
-</body>
-</html>"""
 
 
 def _schedule_exit() -> None:
@@ -2729,35 +2044,15 @@ def run_app(image_paths: Path | list[Path]) -> None:
 
     def generate_review_state(user_hint: str) -> dict[str, Any]:
         print(f"Starting AI analysis pipeline. Hint: {user_hint!r}", flush=True)
-        if photo_count == 1:
-            single_proposal = vision.propose_metadata(
-                image_data_url=prepared_photos[0].image_data_url,
-                metadata=prepared_photos[0].metadata,
-                suffix_hint=commons_config.filename_suffix,
-                user_hint=user_hint,
-            )
-            proposal = {
-                "group_filename_stem": single_proposal["filename_stem"],
-                "photos": [
-                    {
-                        "caption_en": single_proposal["caption_en"],
-                        "visual_summary": single_proposal["visual_summary"],
-                    }
-                ],
-                "keywords": single_proposal["keywords"],
-                "search_queries": single_proposal["search_queries"],
-                "relationship_queries": single_proposal["relationship_queries"],
-                "group_summary": single_proposal["visual_summary"],
-                "research_summary": single_proposal["research_summary"],
-            }
-        else:
-            proposal = vision.propose_group_metadata(
-                image_data_urls=[photo.image_data_url for photo in prepared_photos],
-                metadatas=[photo.metadata for photo in prepared_photos],
-                suffix_hint=commons_config.filename_suffix,
-                user_hint=user_hint,
-                source_names=[photo.source_path.name for photo in prepared_photos],
-            )
+        image_data_urls = [photo.image_data_url for photo in prepared_photos]
+        metadatas = [photo.metadata for photo in prepared_photos]
+        proposal = vision.propose_group_metadata(
+            image_data_urls=image_data_urls,
+            metadatas=metadatas,
+            suffix_hint=commons_config.filename_suffix,
+            user_hint=user_hint,
+            source_names=[photo.source_path.name for photo in prepared_photos],
+        )
         print("OpenAI group proposal received.", flush=True)
         relationship_queries = _dedupe_preserve_order(
             [
@@ -2801,46 +2096,34 @@ def run_app(image_paths: Path | list[Path]) -> None:
             max_candidate_categories=commons_config.max_candidate_categories,
             max_parent_depth=commons_config.max_parent_depth,
         )
-        if photo_count == 1:
-            single_selection = vision.choose_categories(
-                image_data_url=prepared_photos[0].image_data_url,
-                metadata=prepared_photos[0].metadata,
-                proposed_caption=proposal["photos"][0]["caption_en"],
-                proposed_summary=proposal["photos"][0]["visual_summary"],
-                research_summary=proposal["research_summary"],
-                category_graph=category_graph,
-                user_hint=user_hint,
-            )
-            selected = {
-                "photo_categories": [single_selection["selected_categories"]],
-                "reasoning_summary": single_selection["reasoning_summary"],
-            }
-        else:
-            selected = vision.choose_group_categories(
-                image_data_urls=[photo.image_data_url for photo in prepared_photos],
-                metadatas=[photo.metadata for photo in prepared_photos],
-                proposed_photos=proposal["photos"],
-                group_summary=proposal["group_summary"],
-                research_summary=proposal["research_summary"],
-                category_graph=category_graph,
-                user_hint=user_hint,
-            )
+        selected = vision.choose_group_categories(
+            image_data_urls=image_data_urls,
+            metadatas=metadatas,
+            proposed_photos=proposal["photos"],
+            group_summary=proposal["group_summary"],
+            research_summary=proposal["research_summary"],
+            category_graph=category_graph,
+            user_hint=user_hint,
+        )
         print("OpenAI group category selection received.", flush=True)
+        selected = vision.review_group_categories(
+            image_data_urls=image_data_urls,
+            metadatas=metadatas,
+            proposed_photos=proposal["photos"],
+            photo_categories=selected["photo_categories"],
+            group_summary=proposal["group_summary"],
+            research_summary=proposal["research_summary"],
+            category_graph=category_graph,
+            user_hint=user_hint,
+        )
         filenames = _numbered_filenames(
             proposal["group_filename_stem"],
             commons_config.filename_suffix,
             [photo.upload_path.suffix for photo in prepared_photos],
         )
-        if photo_count == 1:
-            equipment_categories_by_photo = [
-                _resolve_equipment_categories(
-                    commons_api, prepared_photos[0].metadata
-                )
-            ]
-        else:
-            equipment_categories_by_photo = _resolve_group_equipment_categories(
-                commons_api, [photo.metadata for photo in prepared_photos]
-            )
+        equipment_categories_by_photo = _resolve_group_equipment_categories(
+            commons_api, metadatas
+        )
         intersection_cache: dict[
             tuple[tuple[str, str], ...], dict[str, dict[str, Any]]
         ] = {}
@@ -2904,7 +2187,7 @@ def run_app(image_paths: Path | list[Path]) -> None:
         return review_state
 
     batch_filenames_by_index: dict[int, str] = {}
-    app = Flask(__name__)
+    app = Flask(__name__, static_folder=str(_review_static_dir()))
 
     @app.get("/")
     def index() -> str:

@@ -1,0 +1,103 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Commons Upload Review</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Source+Code+Pro:wght@400;600&family=Source+Sans+Pro:wght@400;600;700&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="/static/commons_upload.css">
+  <script id="review-config" type="application/json">{{ {"photoCount": photos|length, "qualityImageDisabled": qi_disabled}|tojson }}</script>
+  <script src="/static/commons_upload.js" defer></script>
+</head>
+<body>
+  <main class="page">
+    <div class="photo-stack">
+      {% for photo in photos %}
+      <section class="card image-card">
+        <div class="photo-label">
+          <strong>Photo{% if photos|length > 1 %} {{ loop.index }}{% endif %}</strong>
+          <span>{{ photo.source_name or 'Photo ' ~ loop.index }}</span>
+        </div>
+        <img src="/image/{{ photo.index|default(loop.index0) }}" alt="Upload preview {{ loop.index }}">
+        <details class="meta" open>
+          <summary>Metadata</summary>
+          <pre>{{ photo.metadata|default({})|tojson(indent=2) }}</pre>
+        </details>
+      </section>
+      {% endfor %}
+    </div>
+    <section class="card form-card">
+      <div id="hint-stage">
+        <p class="eyebrow">Wikimedia Commons</p>
+        <h1>{% if photos|length == 1 %}Prepare Commons Upload{% else %}Prepare {{ photos|length }}-Photo Commons Group{% endif %}</h1>
+        {% for photo in photos %}
+        {% if photo.sha1_matches %}
+        {% set photo_index = photo.index|default(loop.index0) %}
+        <div class="warning-banner">
+          <h2>Possible Existing Upload: {% if photos|length == 1 %}This photo{% else %}Photo {{ photo_index + 1 }}{% endif %}</h2>
+          <p>Its raw SHA1 sum was found on Commons. Continue if this is intentionally different, or overwrite an existing file if this is a minor improved version.</p>
+          {% if photo.raw_sha1sum %}<p><code>{{ photo.raw_sha1sum }}</code></p>{% endif %}
+          <ul>
+            {% for match in photo.sha1_matches %}
+            <li>
+              <a href="{{ match.url }}" target="_blank" rel="noreferrer">{{ match.title }}</a>
+              <button type="button" class="secondary overwrite-btn" data-photo-index="{{ photo_index }}" data-file-title="{{ match.title }}">Overwrite this file</button>
+            </li>
+            {% endfor %}
+          </ul>
+        </div>
+        {% endif %}
+        {% endfor %}
+        <label for="hint">Hint</label>
+        <textarea id="hint" placeholder="Optional: identify the shared subject, place, event, viewpoint, or other context."></textarea>
+        <div class="actions">
+          <button type="button" class="primary" id="analyze">Generate proposal</button>
+        </div>
+      </div>
+      <div id="review-stage" hidden>
+        <p class="eyebrow">Wikimedia Commons</p>
+        <h1>Review Commons Upload</h1>
+        <label for="review-hint">Hint</label>
+        <textarea id="review-hint" placeholder="Optional hint for re-analysis."></textarea>
+        <div class="actions">
+          <button type="button" class="secondary" id="redo">Redo with hint</button>
+        </div>
+        <div id="photo-fields"></div>
+        <p class="inline-note">{{ qi_count }}/{{ qi_limit }} Quality Image nominations listed for {{ qi_date }} UTC.</p>
+        {% if qi_disabled %}
+        <p class="inline-warning">{{ qi_count }}/{{ qi_limit }} Quality Image nominations already listed for {{ qi_date }} UTC.</p>
+        {% endif %}
+        <div class="actions">
+          <button type="button" class="primary" id="submit">{% if photos|length == 1 %}Save and upload{% else %}Upload {{ photos|length }} photos{% endif %}</button>
+        </div>
+      </div>
+      <div class="actions">
+        <div class="spinner" id="spinner" aria-hidden="true"></div>
+        <div class="status" id="status" role="status" aria-live="polite"></div>
+      </div>
+    </section>
+  </main>
+  <template id="category-row-template">
+    <div class="category-row">
+      <input type="text" class="category-input" aria-label="Commons category">
+      <button type="button" class="secondary remove-btn">Remove</button>
+    </div>
+  </template>
+  <template id="photo-editor-template">
+    <section class="photo-editor">
+      <h2></h2>
+      <label>Filename<input type="text" class="filename-input"></label>
+      <label>Caption<textarea class="caption-input"></textarea></label>
+      <div class="field-label">Categories</div>
+      <div class="photo-categories"></div>
+      <button type="button" class="secondary add-category">Add category</button>
+      <label class="checkbox-row">
+        <input type="checkbox" class="quality-image-input">
+        <span>Nominate as Quality Image</span>
+      </label>
+    </section>
+  </template>
+</body>
+</html>

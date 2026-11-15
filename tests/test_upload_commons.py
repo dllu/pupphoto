@@ -1,17 +1,21 @@
-from datetime import date, datetime, timezone
-from pathlib import Path
+import json
 import tempfile
 import unittest
+from datetime import date, datetime, timezone
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
+import httpx
+from openai import OpenAI
 from PIL import Image, ImageCms
 
+from commons_categories import _build_category_graph
+from config import OpenAIConfig
 from upload_commons import (
     CommonsApi,
     PhotoMetadata,
     VisionClient,
-    build_description_wikitext,
     _category_intersection_query,
     _count_quality_image_nominations,
     _html_page,
@@ -22,9 +26,10 @@ from upload_commons import (
     _refine_category_intersections,
     _remove_ancestor_duplicates,
     _remove_gps_metadata,
+    _upload_safe_image_path,
     _utc_date_label,
     _utc_signature,
-    _upload_safe_image_path,
+    build_description_wikitext,
     run_app,
 )
 
@@ -227,7 +232,6 @@ class CommonsChunkedUploadTest(unittest.TestCase):
                 "filename": "Example photo.jpg",
                 "comment": "Upload summary",
                 "text": "Description text",
-                "ignorewarnings": "0",
                 "token": "csrf-token",
             },
         )
@@ -300,11 +304,113 @@ class CommonsChunkedUploadTest(unittest.TestCase):
                 "filename": "Example photo.jpg",
                 "comment": "Upload summary",
                 "text": "Description text",
-                "ignorewarnings": "0",
                 "token": "csrf-token",
                 "filekey": "stash-final.jpg",
             },
         )
+
+    def test_filename_collision_preserves_existing_photo(self) -> None:
+        image_path = self._image_path(b"a different photo")
+        filename = "Example photo.jpg"
+
+        for chunked in (False, True):
+            with self.subTest(chunked=chunked):
+                existing_contents = b"the original photo"
+                remote_files = {filename: existing_contents}
+                stashed_contents = bytearray()
+                api = self._api([])
+
+                def respond(params, files=None):
+                    if "stash" in params:
+                        stashed_contents.extend(files["chunk"][1])
+                        return {
+                            "upload": {"result": "Success", "filekey": "stash.jpg"}
+                        }
+                    # Match MediaWiki's boolean semantics: even "0" means true.
+                    if (
+                        params["filename"] in remote_files
+                        and "ignorewarnings" not in params
+                    ):
+                        return {
+                            "upload": {
+                                "result": "Warning",
+                                "warnings": {"exists": params["filename"]},
+                                "filekey": "stash.jpg",
+                            }
+                        }
+                    remote_files[params["filename"]] = (
+                        bytes(stashed_contents)
+                        if "filekey" in params
+                        else files["file"][1].read()
+                    )
+                    return {"upload": {"result": "Success"}}
+
+                api.post_upload.side_effect = respond
+                with (
+                    patch.object(
+                        CommonsApi,
+                        "_CHUNKED_UPLOAD_THRESHOLD_BYTES",
+                        1 if chunked else 100,
+                    ),
+                    patch.object(CommonsApi, "_UPLOAD_CHUNK_SIZE_BYTES", 100),
+                    patch("builtins.print"),
+                ):
+                    with self.assertRaisesRegex(
+                        RuntimeError,
+                        "Refusing to overwrite.*Choose a different filename",
+                    ):
+                        api.upload_file(
+                            image_path=image_path,
+                            filename=filename,
+                            description_wikitext="Description text",
+                            summary="Upload summary",
+                        )
+
+                self.assertEqual(remote_files, {filename: existing_contents})
+                self.assertEqual(api.post_upload.call_count, 2 if chunked else 1)
+
+    def test_other_upload_warnings_are_not_ignored_or_retried(self) -> None:
+        image_path = self._image_path(b"tiny")
+        api = self._api(
+            [
+                {
+                    "upload": {
+                        "result": "Warning",
+                        "warnings": {"duplicate": ["Another photo.jpg"]},
+                        "filekey": "stash.jpg",
+                    }
+                }
+            ]
+        )
+
+        with patch("builtins.print"):
+            with self.assertRaisesRegex(RuntimeError, "Commons upload failed.*duplicate"):
+                api.upload_file(
+                    image_path=image_path,
+                    filename="Example photo.jpg",
+                    description_wikitext="Description text",
+                    summary="Upload summary",
+                )
+
+        api.post_upload.assert_called_once()
+        self.assertNotIn("ignorewarnings", api.post_upload.call_args.kwargs["params"])
+
+    def test_small_explicit_overwrite_ignores_warnings(self) -> None:
+        image_path = self._image_path(b"tiny")
+        api = self._api([{"upload": {"result": "Success"}}])
+
+        with patch("builtins.print"):
+            api.overwrite_file(
+                image_path=image_path,
+                title="File:Existing photo.jpg",
+                summary="Overwrite summary",
+            )
+
+        api.post_upload.assert_called_once()
+        request = api.post_upload.call_args.kwargs
+        self.assertEqual(request["params"]["ignorewarnings"], "1")
+        self.assertEqual(request["params"]["filename"], "Existing photo.jpg")
+        self.assertNotIn("text", request["params"])
 
     def test_chunk_upload_refuses_an_unexpected_server_offset(self) -> None:
         image_path = self._image_path(b"abcdefghij")
@@ -382,13 +488,14 @@ class CommonsChunkedUploadTest(unittest.TestCase):
 class HtmlPageTest(unittest.TestCase):
     def test_post_actions_show_local_server_error_on_fetch_failure(self) -> None:
         html = _html_page({"metadata": _metadata(True).to_model_dict()})
-
-        self.assertIn("serverUnavailableMessage", html)
-        self.assertIn("The local upload server is no longer responding", html)
-        self.assertIn('await postJson("/analyze"', html)
-        self.assertIn('await postJson("/submit"', html)
-        self.assertIn('await postJson("/overwrite"', html)
-        self.assertEqual(html.count("await fetch("), 1)
+        self.assertIn('src="/static/commons_upload.js" defer', html)
+        script = (Path(__file__).resolve().parents[1] / "static/commons_upload.js").read_text()
+        self.assertIn("serverUnavailableMessage", script)
+        self.assertIn("The local upload server is no longer responding", script)
+        self.assertIn('await postJson("/analyze"', script)
+        self.assertIn('await postJson("/submit"', script)
+        self.assertIn('await postJson("/overwrite"', script)
+        self.assertEqual(script.count("await fetch("), 1)
 
     def test_group_page_renders_every_preview_and_batch_editor(self) -> None:
         metadata = _metadata(True).to_model_dict()
@@ -414,9 +521,47 @@ class HtmlPageTest(unittest.TestCase):
 
         self.assertIn('src="/image/0"', html)
         self.assertIn('src="/image/1"', html)
-        self.assertIn("const photoCount = 2", html)
-        self.assertIn("The topical categories were selected using the whole group", html)
-        self.assertIn("photos,", html)
+        self.assertIn('"photoCount": 2', html)
+        self.assertIn('<details class="meta" open>', html)
+        self.assertIn('id="photo-editor-template"', html)
+
+    def test_template_escapes_filenames_metadata_and_overwrite_attributes(self) -> None:
+        html = _html_page({
+            "photos": [{
+                "index": 0,
+                "source_name": '<script>alert("source")</script>.jpg',
+                "metadata": {"model": "</pre><script>alert('metadata')</script>"},
+                "raw_sha1sum": "<raw-sha1>",
+                "sha1_matches": [{
+                    "title": 'File:Photo " onmouseover="alert(1)',
+                    "url": 'https://commons.wikimedia.org/wiki/File:Photo?x="bad"&y=1',
+                }],
+            }],
+        })
+        self.assertNotIn('<script>alert(', html)
+        self.assertNotIn('data-file-title="File:Photo " onmouseover=', html)
+        self.assertIn('&lt;script&gt;alert(&#34;source&#34;)&lt;/script&gt;.jpg', html)
+        self.assertIn('data-file-title="File:Photo &#34; onmouseover=&#34;alert(1)"', html)
+        self.assertIn('&lt;raw-sha1&gt;', html)
+
+    def test_quality_image_limit_disables_nominations_in_client_config(self) -> None:
+        html = _html_page({
+            "quality_image_nominations_today": 5,
+            "quality_image_nomination_limit": 5,
+            "quality_image_nomination_date": "7 November 2026",
+        })
+        self.assertIn('"qualityImageDisabled": true', html)
+        self.assertIn('5/5 Quality Image nominations already listed for 7 November 2026 UTC.', html)
+
+
+class VisionModelConfigTest(unittest.TestCase):
+    def test_defaults_to_sol_and_preserves_explicit_model_override(self) -> None:
+        values = {"api_key": "test-key", "image_detail": "high", "downsized_max_dimension": 1600}
+        self.assertEqual(OpenAIConfig.from_dict(values, Path(".")).vision_model, "gpt-6.1-sol")
+        self.assertEqual(
+            OpenAIConfig.from_dict({**values, "vision_model": "custom-model"}, Path(".")).vision_model,
+            "custom-model",
+        )
 
 
 class GroupFilenameTest(unittest.TestCase):
@@ -507,6 +652,8 @@ class GroupVisionRequestTest(unittest.TestCase):
 
         self.assertEqual(len(result["photos"]), 2)
         request_kwargs = client.client.responses.create.call_args.kwargs
+        self.assertEqual(request_kwargs["model"], "test-model")
+        self.assertEqual(request_kwargs["reasoning"], {"effort": "low"})
         user_content = request_kwargs["input"][1]["content"]
         image_urls = [
             item["image_url"]
@@ -525,13 +672,12 @@ class GroupVisionRequestTest(unittest.TestCase):
         client = VisionClient.__new__(VisionClient)
         client.config = SimpleNamespace(vision_model="test-model", image_detail="high")
         client.client = MagicMock()
-        client.client.responses.create.return_value = SimpleNamespace(
-            output_text=(
-                '{"photo_categories":['
-                '["Category:Deer in Nara"],["Category:Deer in Nara"]],'
-                '"reasoning_summary":"Shared subject and place."}'
-            )
-        )
+        client.client.post.return_value = {
+            "answers": [
+                {"type": "predicate", "name": "photo_1_category_1", "probability": 0.9},
+                {"type": "predicate", "name": "photo_2_category_1", "probability": 0.8},
+            ]
+        }
 
         with patch("builtins.print"):
             result = client.choose_group_categories(
@@ -569,16 +715,347 @@ class GroupVisionRequestTest(unittest.TestCase):
             result["photo_categories"],
             [["Category:Deer in Nara"], ["Category:Deer in Nara"]],
         )
-        request_kwargs = client.client.responses.create.call_args.kwargs
+        client.client.responses.create.assert_not_called()
+        self.assertEqual(client.client.post.call_args.args, ("/decisions",))
+        request_body = client.client.post.call_args.kwargs["body"]
+        self.assertEqual(request_body["model"], "gpt-6-luna")
+        self.assertEqual([item["role"] for item in request_body["input"]], ["user"])
         self.assertEqual(
             sum(
                 item["type"] == "input_image"
-                for item in request_kwargs["input"][1]["content"]
+                for item in request_body["input"][0]["content"]
             ),
             2,
         )
-        schema = request_kwargs["text"]["format"]["schema"]
-        self.assertEqual(schema["properties"]["photo_categories"]["minItems"], 2)
+        self.assertEqual(
+            [question["name"] for question in request_body["questions"]],
+            ["photo_1_category_1", "photo_2_category_1"],
+        )
+        self.assertTrue(
+            all(question["type"] == "predicate" for question in request_body["questions"])
+        )
+
+
+class DecisionCategorySelectionTest(unittest.TestCase):
+    def setUp(self) -> None:
+        self.client = VisionClient.__new__(VisionClient)
+        self.client.config = SimpleNamespace(vision_model="test-model", image_detail="high")
+        self.client.client = MagicMock()
+        self.graph = {
+            "nodes": {
+                "Category:Deer in Nara": {"file_count": 10},
+                "Category:Side views of deer": {"file_count": 5},
+                "Category:Empty category": {"file_count": 0},
+            }
+        }
+
+    def _choose(self, photo_count: int = 2) -> dict[str, object]:
+        with patch("builtins.print"):
+            return self.client.choose_group_categories(
+                image_data_urls=["data:image/jpeg;base64,test"] * photo_count,
+                metadatas=[_metadata(True)] * photo_count,
+                proposed_photos=[
+                    {"caption_en": "A deer.", "visual_summary": "Deer in Nara Park."}
+                ] * photo_count,
+                group_summary="Related views of deer.",
+                research_summary="",
+                category_graph=self.graph,
+                user_hint="Nara Park",
+            )
+
+    def test_threshold_allows_multiple_categories_and_distinguishes_photos(self) -> None:
+        self.client.client.post.return_value = {
+            "answers": [
+                {"type": "predicate", "name": "photo_2_category_1", "probability": 0.9},
+                {"type": "predicate", "name": "photo_2_category_2", "probability": 0.49},
+                {"type": "predicate", "name": "photo_1_category_1", "probability": 1},
+                {"type": "predicate", "name": "photo_1_category_2", "probability": 0.5},
+            ]
+        }
+
+        result = self._choose()
+
+        self.assertEqual(result["photo_categories"], [
+            ["Category:Deer in Nara", "Category:Side views of deer"],
+            ["Category:Deer in Nara"],
+        ])
+        questions = self.client.client.post.call_args.kwargs["body"]["questions"]
+        self.assertEqual(len(questions), 4)
+        self.assertFalse(any("Empty category" in item["instructions"] for item in questions))
+
+    def test_single_photo_wrapper_works_with_installed_sdk_http_transport(self) -> None:
+        request_bodies: list[dict[str, object]] = []
+
+        def handle(request: httpx.Request) -> httpx.Response:
+            self.assertEqual(request.method, "POST")
+            self.assertEqual(request.url.path, "/v1/decisions")
+            request_bodies.append(json.loads(request.content))
+            return httpx.Response(200, json={
+                "answers": [
+                    {"type": "predicate", "name": "photo_1_category_1", "probability": 0.9},
+                    {"type": "predicate", "name": "photo_1_category_2", "probability": 0.1},
+                ]
+            })
+
+        with OpenAI(
+            api_key="test-key",
+            http_client=httpx.Client(transport=httpx.MockTransport(handle)),
+        ) as api_client:
+            self.client.client = api_client
+            with patch("builtins.print"):
+                result = self.client.choose_categories(
+                    image_data_url="data:image/jpeg;base64,test",
+                    metadata=_metadata(True),
+                    proposed_caption="A deer.",
+                    proposed_summary="Deer in Nara Park.",
+                    research_summary="",
+                    category_graph=self.graph,
+                    user_hint="Nara Park",
+                )
+
+        self.assertEqual(result["selected_categories"], ["Category:Deer in Nara"])
+        self.assertEqual(len(request_bodies), 1)
+        self.assertEqual(request_bodies[0]["model"], "gpt-6-luna")
+
+    def test_no_candidates_skips_decisions_request(self) -> None:
+        for nodes in ({}, {"Category:Empty category": {"file_count": 0}}):
+            with self.subTest(nodes=nodes):
+                self.graph = {"nodes": nodes}
+                self.assertEqual(self._choose()["photo_categories"], [[], []])
+        self.client.client.post.assert_not_called()
+
+    def test_large_category_selections_use_bounded_requests_with_shared_context(self) -> None:
+        cases = ((1, 400), (1, 401), (1, 448), (2, 224), (4, 224))
+        for photo_count, category_count in cases:
+            with self.subTest(photo_count=photo_count, category_count=category_count):
+                titles = [
+                    f"Category:Candidate {index}"
+                    for index in range(1, category_count + 1)
+                ]
+                self.graph = {"nodes": {title: {"file_count": 1} for title in titles}}
+                request_bodies = []
+
+                def handle(request: httpx.Request) -> httpx.Response:
+                    body = json.loads(request.content)
+                    request_bodies.append(body)
+                    questions = body["questions"]
+                    self.assertGreater(len(questions), 0)
+                    self.assertLessEqual(len(questions), 400)
+                    answers = []
+                    for question in reversed(questions):
+                        photo_number, category_number = (
+                            int(part) for part in question["name"].split("_")[1::2]
+                        )
+                        if category_number == 2:
+                            answers.append({"type": "refusal", "name": question["name"]})
+                        else:
+                            answers.append({
+                                "type": "predicate",
+                                "name": question["name"],
+                                "probability": (
+                                    0.5 if category_number % photo_number == 0 else 0.49
+                                ),
+                            })
+                    return httpx.Response(200, json={"answers": answers})
+
+                with OpenAI(
+                    api_key="test-key",
+                    max_retries=0,
+                    http_client=httpx.Client(transport=httpx.MockTransport(handle)),
+                ) as api_client:
+                    self.client.client = api_client
+                    result = self._choose(photo_count=photo_count)
+
+                question_count = photo_count * category_count
+                self.assertEqual(
+                    [len(body["questions"]) for body in request_bodies],
+                    [
+                        min(400, question_count - start)
+                        for start in range(0, question_count, 400)
+                    ],
+                )
+                self.assertEqual(
+                    [
+                        question["name"]
+                        for body in request_bodies
+                        for question in body["questions"]
+                    ],
+                    [
+                        f"photo_{photo}_category_{category}"
+                        for photo in range(1, photo_count + 1)
+                        for category in range(1, category_count + 1)
+                    ],
+                )
+                for body in request_bodies:
+                    self.assertEqual(body["input"], request_bodies[0]["input"])
+                    self.assertEqual(
+                        sum(
+                            item["type"] == "input_image"
+                            for item in body["input"][0]["content"]
+                        ),
+                        photo_count,
+                    )
+                self.assertEqual(len(result["photo_categories"]), photo_count)
+                for photo_number, categories in enumerate(
+                    result["photo_categories"], start=1
+                ):
+                    self.assertCountEqual(categories, [
+                        title for index, title in enumerate(titles, start=1)
+                        if index != 2 and index % photo_number == 0
+                    ])
+                self.assertIn(
+                    f"Skipped {photo_count} refused", result["reasoning_summary"]
+                )
+
+    def test_each_batch_validates_its_own_answers(self) -> None:
+        self.graph = {"nodes": {
+            f"Category:Candidate {index}": {"file_count": 1}
+            for index in range(1, 402)
+        }}
+        valid_answers = [
+            {"type": "predicate", "name": f"photo_1_category_{index}", "probability": 0.9}
+            for index in range(1, 401)
+        ]
+        for answers in (
+            valid_answers[:-1],
+            valid_answers[:-1] + [valid_answers[0]],
+            valid_answers[:-1] + [{**valid_answers[-1], "name": "photo_1_category_401"}],
+        ):
+            with self.subTest(last_answer=answers[-1]["name"], answer_count=len(answers)):
+                self.client.client.post.reset_mock()
+                self.client.client.post.return_value = {"answers": answers}
+                with self.assertRaisesRegex(RuntimeError, "unexpected"):
+                    self._choose(photo_count=1)
+                self.client.client.post.assert_called_once()
+
+    def test_refused_questions_are_skipped(self) -> None:
+        self.client.client.post.return_value = {
+            "answers": [
+                {"type": "refusal", "name": "photo_1_category_1"},
+                {"type": "predicate", "name": "photo_1_category_2", "probability": 0.9},
+            ]
+        }
+
+        result = self._choose(photo_count=1)
+
+        self.assertEqual(result["photo_categories"], [["Category:Side views of deer"]])
+        self.assertIn("Skipped 1 refused", result["reasoning_summary"])
+
+    def test_missing_duplicate_or_unknown_answers_fail(self) -> None:
+        valid_answer = {
+            "type": "predicate", "name": "photo_1_category_1", "probability": 0.9,
+        }
+        for answers in (
+            [],
+            [valid_answer],
+            [valid_answer, valid_answer],
+            [valid_answer, {**valid_answer, "name": "unknown"}],
+        ):
+            with self.subTest(answers=answers):
+                self.client.client.post.return_value = {"answers": answers}
+                with self.assertRaisesRegex(RuntimeError, "unexpected"):
+                    self._choose(photo_count=1)
+
+    def test_invalid_probabilities_and_answer_types_fail(self) -> None:
+        for probability in (None, "0.9", True, -0.1, 1.1, float("nan")):
+            with self.subTest(probability=probability):
+                self.client.client.post.return_value = {
+                    "answers": [
+                        {"type": "predicate", "name": "photo_1_category_1", "probability": probability},
+                        {"type": "refusal", "name": "photo_1_category_2"},
+                    ]
+                }
+                with self.assertRaisesRegex(RuntimeError, "invalid category probability"):
+                    self._choose(photo_count=1)
+        self.client.client.post.return_value = {
+            "answers": [
+                {"type": "choice", "name": "photo_1_category_1", "probability": 0.9},
+                {"type": "refusal", "name": "photo_1_category_2"},
+            ]
+        }
+        with self.assertRaisesRegex(RuntimeError, "invalid category probability"):
+            self._choose(photo_count=1)
+
+    def test_too_many_images_fails_before_request(self) -> None:
+        with self.assertRaisesRegex(ValueError, "at most 128 photos"):
+            self._choose(photo_count=129)
+        self.client.client.post.assert_not_called()
+
+
+class CategoryReviewTest(unittest.TestCase):
+    def setUp(self) -> None:
+        self.client = VisionClient.__new__(VisionClient)
+        self.client.config = SimpleNamespace(vision_model="test-model", image_detail="high")
+        self.client.client = MagicMock()
+        self.model = "Category:Toyota Camry (XV10)"
+        self.white_sedans = "Category:White Toyota sedans"
+        self.white = "Category:White automobiles in California"
+        self.parked = "Category:Parked automobiles in California"
+        self.transport = "Category:Transport in San Jose, California"
+        self.city = "Category:San Jose, California"
+        self.categories = [
+            [self.city, "Category:Sedans", self.model, self.white_sedans,
+             self.white, self.parked, self.transport],
+            [self.model, "Category:Black automobiles in California", self.city],
+        ]
+
+    def _review(self, photos: list[object]) -> dict[str, object]:
+        self.client.client.responses.create.return_value = SimpleNamespace(
+            output_text=json.dumps({"photos": photos, "reasoning_summary": "Specific facets."})
+        )
+        with patch("builtins.print"):
+            return self.client.review_group_categories(
+                image_data_urls=["data:image/jpeg;base64,white", "data:image/jpeg;base64,black"],
+                metadatas=[_metadata(True), _metadata(False)],
+                proposed_photos=[
+                    {"caption_en": "A white Camry.", "visual_summary": "Parked white sedan."},
+                    {"caption_en": "A black Camry.", "visual_summary": "Black sedan."},
+                ],
+                photo_categories=self.categories,
+                group_summary="Two cars in San Jose.",
+                research_summary="",
+                category_graph={"nodes": {self.model: {"parents": ["Category:Toyota Camry"]}}},
+                user_hint="San Jose, California",
+            )
+
+    def test_review_keeps_independent_facets_in_their_original_photos(self) -> None:
+        retained = [self.model, self.white_sedans, self.white, self.parked, self.transport]
+        result = self._review([
+            {"selected_categories": list(reversed(retained))},
+            {"selected_categories": self.categories[1][:-1]},
+        ])
+
+        self.assertEqual(result["photo_categories"], [retained, self.categories[1][:-1]])
+        kwargs = self.client.client.responses.create.call_args.kwargs
+        self.assertEqual(kwargs["model"], "test-model")
+        content = kwargs["input"][1]["content"]
+        self.assertEqual(
+            [item["image_url"] for item in content if item["type"] == "input_image"],
+            ["data:image/jpeg;base64,white", "data:image/jpeg;base64,black"],
+        )
+        context = json.loads(content[0]["text"])
+        self.assertEqual([photo["categories"] for photo in context["photos"]], self.categories)
+        self.assertIsNone(context["photos"][1]["metadata"]["latitude"])
+        schema = kwargs["text"]["format"]["schema"]["properties"]["photos"]
+        self.assertEqual(schema["minItems"], 2)
+        self.assertEqual(schema["maxItems"], 2)
+
+    def test_review_rejects_invented_or_transferred_categories_and_bad_counts(self) -> None:
+        for photos in (
+            [],
+            [{"selected_categories": [self.model]}],
+            [{"selected_categories": ["Category:Invented"]}, {"selected_categories": []}],
+            [{"selected_categories": [self.categories[1][1]]}, {"selected_categories": []}],
+            [{"selected_categories": [None]}, {"selected_categories": []}],
+        ):
+            with self.subTest(photos=photos):
+                with self.assertRaises(RuntimeError):
+                    self._review(photos)
+
+    def test_empty_selection_skips_review_request(self) -> None:
+        self.categories = [[], []]
+        self.assertEqual(self._review([])["photo_categories"], [[], []])
+        self.client.client.responses.create.assert_not_called()
 
 
 class BatchUploadFlowTest(unittest.TestCase):
@@ -589,8 +1066,8 @@ class BatchUploadFlowTest(unittest.TestCase):
         def propose_group_metadata(self, **kwargs: object) -> dict[str, object]:
             image_data_urls = kwargs["image_data_urls"]
             assert isinstance(image_data_urls, list)
-            if len(image_data_urls) != 2:
-                raise AssertionError("Expected both photos in the proposal request")
+            if len(image_data_urls) not in (1, 2):
+                raise AssertionError("Expected one or two photos in the proposal request")
             return {
                 "group_filename_stem": "Sika deer in Nara Park",
                 "photos": [
@@ -602,7 +1079,7 @@ class BatchUploadFlowTest(unittest.TestCase):
                         "caption_en": "Side view of a sika deer in Nara Park.",
                         "visual_summary": "Side view of the deer.",
                     },
-                ],
+                ][:len(image_data_urls)],
                 "keywords": ["sika deer", "Nara Park"],
                 "search_queries": ["Deer in Nara"],
                 "relationship_queries": [],
@@ -613,15 +1090,16 @@ class BatchUploadFlowTest(unittest.TestCase):
         def choose_group_categories(self, **kwargs: object) -> dict[str, object]:
             image_data_urls = kwargs["image_data_urls"]
             assert isinstance(image_data_urls, list)
-            if len(image_data_urls) != 2:
-                raise AssertionError("Expected both photos in the category request")
             return {
-                "photo_categories": [
-                    ["Category:Deer in Nara"],
-                    ["Category:Deer in Nara"],
-                ],
+                "photo_categories": [["Category:Deer in Nara"] for _ in image_data_urls],
                 "reasoning_summary": "The category applies to the whole group.",
             }
+
+        def review_group_categories(self, **kwargs: object) -> dict[str, object]:
+            categories = kwargs["photo_categories"]
+            assert len(categories) == len(kwargs["image_data_urls"])
+            assert categories == [["Category:Deer in Nara"] for _ in categories]
+            return {"photo_categories": categories, "reasoning_summary": "Specific category."}
 
     class FakeCommonsApi:
         last_instance: "BatchUploadFlowTest.FakeCommonsApi | None" = None
@@ -647,6 +1125,12 @@ class BatchUploadFlowTest(unittest.TestCase):
             return f"https://commons.wikimedia.org/wiki/File:{filename}"
 
     def test_review_and_submit_uploads_the_ordered_group(self) -> None:
+        self._check_review_and_submit(photo_count=2)
+
+    def test_single_photo_keeps_legacy_review_and_submit_contracts(self) -> None:
+        self._check_review_and_submit(photo_count=1)
+
+    def _check_review_and_submit(self, photo_count: int) -> None:
         source_dir = self.enterContext(tempfile.TemporaryDirectory())
         first_path = Path(source_dir) / "first.jpg"
         second_path = Path(source_dir) / "second.jpg"
@@ -699,46 +1183,149 @@ class BatchUploadFlowTest(unittest.TestCase):
             patch("upload_commons._schedule_exit") as schedule_exit,
             patch("builtins.print"),
         ):
-            run_app([first_path, second_path])
+            run_app([first_path, second_path][:photo_count])
             app = captured["app"]
             client = app.test_client()
 
+            self.assertEqual(client.get("/").status_code, 200)
+            for asset in ("commons_upload.css", "commons_upload.js"):
+                with client.get(f"/static/{asset}") as response:
+                    self.assertEqual(response.status_code, 200)
+                    self.assertTrue(response.data)
             analyze_response = client.post("/analyze", json={"hint": "Nara Park"})
             self.assertEqual(analyze_response.status_code, 200)
             review = analyze_response.get_json()
-            self.assertEqual(
-                [photo["filename"] for photo in review["photos"]],
-                [
+            expected_filenames = (
+                ["Sika deer in Nara Park by Example.jpg"] if photo_count == 1 else [
                     "Sika deer in Nara Park 01 by Example.jpg",
                     "Sika deer in Nara Park 02 by Example.jpg",
-                ],
+                ]
             )
+            self.assertEqual(
+                [photo["filename"] for photo in review["photos"]], expected_filenames
+            )
+            if photo_count == 1:
+                self.assertEqual(review["filename"], review["photos"][0]["filename"])
+                self.assertEqual(review["caption"], review["photos"][0]["caption"])
+                self.assertEqual(review["categories"], review["photos"][0]["categories"])
 
             submit_response = client.post(
                 "/submit",
-                json={"photos": review["photos"]},
+                json=review if photo_count == 1 else {"photos": review["photos"]},
             )
 
         self.assertEqual(submit_response.status_code, 200)
         upload_result = submit_response.get_json()
-        self.assertEqual(len(upload_result["uploaded_files"]), 2)
+        self.assertEqual(len(upload_result["uploaded_files"]), photo_count)
         api = self.FakeCommonsApi.last_instance
         self.assertIsNotNone(api)
         self.assertEqual(
             [upload["filename"] for upload in api.uploads],
-            [
-                "Sika deer in Nara Park 01 by Example.jpg",
-                "Sika deer in Nara Park 02 by Example.jpg",
-            ],
+            expected_filenames,
         )
         self.assertIn("Front view", api.uploads[0]["description_wikitext"])
-        self.assertIn("Side view", api.uploads[1]["description_wikitext"])
+        if photo_count == 2:
+            self.assertIn("Side view", api.uploads[1]["description_wikitext"])
         self.assertIn("[[Category:Deer in Nara]]", api.uploads[0]["description_wikitext"])
         for upload in api.uploads:
             description = upload["description_wikitext"]
-            self.assertIn("File:Sika deer in Nara Park 01 by Example.jpg", description)
-            self.assertIn("File:Sika deer in Nara Park 02 by Example.jpg", description)
+            if photo_count == 2:
+                for filename in expected_filenames:
+                    self.assertIn(f"File:{filename}", description)
+            else:
+                self.assertNotIn("<gallery", description)
         schedule_exit.assert_called_once_with()
+
+
+class CategoryGraphTest(unittest.TestCase):
+    def test_exact_facet_titles_take_priority_and_only_unresolved_queries_are_searched(self) -> None:
+        exact = [
+            "Category:Toyota Camry (XV10)",
+            "Category:White Toyota sedans",
+            "Category:White automobiles in California",
+            "Category:Parked automobiles in California",
+        ]
+        api = MagicMock()
+        api.existing_category_titles.return_value = exact
+        api.search_categories.return_value = ["Category:Toyota Camry", "Category:Sedans"]
+        api.category_details.side_effect = lambda titles: {
+            title: {"parents": [], "file_count": 10} for title in titles
+        }
+        queries = [title.removeprefix("Category:") for title in exact]
+
+        with patch("builtins.print"):
+            graph = _build_category_graph(
+                api, queries + ["1994 Toyota Camry"], 8, 4, max_parent_depth=0
+            )
+
+        self.assertEqual(set(graph["nodes"]), set(exact))
+        api.search_categories.assert_called_once_with("1994 Toyota Camry", 8)
+        for title in exact:
+            self.assertEqual(graph["nodes"][title]["source"], "exact")
+
+    def test_boundary_categories_keep_parent_edges_for_ancestor_cleanup(self) -> None:
+        county = "Category:Geography of Santa Clara County, California"
+        bay = "Category:Geography of the San Francisco Bay Area"
+        seed = "Category:Local park views"
+        details = {
+            seed: {"parents": [county, bay], "file_count": 10},
+            county: {"parents": [bay], "file_count": 3},
+            bay: {"parents": ["Category:Geography of California by location"], "file_count": 6},
+        }
+        api = MagicMock()
+        api._MAX_CHILD_CATEGORY_LOOKUPS = 0
+        api.search_categories.return_value = [seed]
+        api.existing_category_titles.return_value = []
+        api.category_subcategories.return_value = {}
+        api.category_details.side_effect = lambda titles: {title: details[title] for title in titles}
+        api.category_counts.return_value = {county: {"file_count": 3}, bay: {"file_count": 6}}
+
+        with patch("builtins.print"):
+            graph = _build_category_graph(api, ["local park"], 8, 40, max_parent_depth=1)
+
+        selected = _remove_ancestor_duplicates(
+            [county.removeprefix("Category:"), bay.removeprefix("Category:")], graph
+        )
+        self.assertEqual(selected, [county.removeprefix("Category:")])
+        # Completing boundary edges must not add another layer of candidates.
+        self.assertEqual(set(graph["nodes"]), {seed, county, bay})
+        self.assertEqual(graph["nodes"][county]["file_count"], 3)
+
+    def test_category_details_merge_paginated_parents_and_reset_between_batches(self) -> None:
+        county = "Category:Geography of Santa Clara County, California"
+        bay = "Category:Geography of the San Francisco Bay Area"
+        state = "Category:Geography of California by county"
+        api = CommonsApi.__new__(CommonsApi)
+        api._TITLE_BATCH_SIZE = 1
+        api.get = MagicMock(side_effect=[
+            {
+                "query": {"pages": [{
+                    "title": county,
+                    "categories": [{"title": state}],
+                    "categoryinfo": {"files": 3, "subcats": 7},
+                }]},
+                "continue": {"clcontinue": "next-parent", "continue": "||"},
+            },
+            {"query": {"pages": [{
+                "title": county,
+                "categories": [{"title": state}, {"title": bay}],
+            }]}},
+            {"query": {"pages": [{
+                "title": bay,
+                "categoryinfo": {"files": 6, "subcats": 24},
+            }]}},
+        ])
+
+        details = api.category_details([county, bay])
+
+        self.assertEqual(details[county], {
+            "parents": [state, bay], "file_count": 3, "subcategory_count": 7,
+        })
+        self.assertEqual(details[bay], {
+            "parents": [], "file_count": 6, "subcategory_count": 24,
+        })
+        self.assertEqual(api.get.call_args_list[1].kwargs["clcontinue"], "next-parent")
+        self.assertNotIn("clcontinue", api.get.call_args_list[2].kwargs)
 
 
 class CategorySelectionTest(unittest.TestCase):

@@ -572,6 +572,7 @@ version = "0.1.0"
 source = { editable = "." }
 dependencies = [
     { name = "flask" },
+    { name = "jinja2" },
     { name = "openai" },
     { name = "pillow" },
     { name = "pillow-heif" },
@@ -582,6 +583,7 @@ dependencies = [
 [package.metadata]
 requires-dist = [
     { name = "flask" },
+    { name = "jinja2" },
     { name = "openai" },
     { name = "pillow" },
     { name = "pillow-heif", specifier = ">=1.3.0" },
