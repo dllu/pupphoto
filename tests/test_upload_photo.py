@@ -3,6 +3,7 @@ from types import SimpleNamespace
 import tempfile
 import unittest
 from unittest.mock import call, patch
+from urllib.parse import unquote
 
 from PIL import Image, ImageCms
 
@@ -177,9 +178,9 @@ class UploadPhotoClipboardTest(unittest.TestCase):
             start_new_session=True,
         )
 
-    def test_clipboard_is_populated_before_rclone_upload(self) -> None:
+    def test_clipboard_gets_encoded_url_before_rclone_upload(self) -> None:
         source_dir = self.enterContext(tempfile.TemporaryDirectory())
-        source_path = Path(source_dir) / "photo.jpg"
+        source_path = Path(source_dir) / "café (100%) #1?.jpg"
         thumb_dir = Path(source_dir) / "thumb"
         source_path.write_bytes(b"photo bytes")
 
@@ -187,7 +188,7 @@ class UploadPhotoClipboardTest(unittest.TestCase):
             upload=SimpleNamespace(
                 thumb_dir=thumb_dir,
                 rclone_destination="remote:photos",
-                public_base_url="https://example.test/photos",
+                public_base_url="https://example.test/my%20photos",
             )
         )
 
@@ -199,6 +200,10 @@ class UploadPhotoClipboardTest(unittest.TestCase):
         ):
             url = upload_photo(source_path, clipboard=True)
 
+        self.assertRegex(
+            url,
+            r"^https://example\.test/my%20photos/caf%C3%A9%20%28100%25%29%20%231%3F_[0-9a-f]{16}\.jpg$",
+        )
         self.assertEqual(run.call_args_list[0].args[0], ["xclip", "-selection", "c"])
         self.assertEqual(
             run.call_args_list[0].kwargs,
@@ -216,8 +221,8 @@ class UploadPhotoClipboardTest(unittest.TestCase):
                     "rclone",
                     "copyto",
                     "--ignore-existing",
-                    thumb_dir / "photo.jpg",
-                    f"remote:photos/{url.rsplit('/', 1)[-1]}",
+                    thumb_dir / source_path.name,
+                    f"remote:photos/{unquote(url.rsplit('/', 1)[-1])}",
                 ]
             ),
         )

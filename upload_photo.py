@@ -3,6 +3,7 @@ import hashlib
 import re
 import subprocess
 from pathlib import Path
+from urllib.parse import quote
 
 from PIL import Image, JpegImagePlugin
 from pillow_heif import register_heif_opener
@@ -276,7 +277,7 @@ def upload_photo(src_file, resize=None, clipboard=False, clipboard_format=None):
     dst = f"{config.rclone_destination}/{dst_filename}"
 
     # Upload file, skipping if it already exists remotely
-    dst_url = f"{config.public_base_url}/{dst_filename}"
+    dst_url = f"{config.public_base_url}/{quote(dst_filename, safe='')}"
     if clipboard or clipboard_format is not None:
         clipboard_text = (
             dst_url

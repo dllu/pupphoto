@@ -137,8 +137,10 @@ def copy_and_rename_files(
                 continue
             sha1 = sha1sum(file_path)
             new_filename = f"{new_base_filename}_{sha1}"
-            shutil.copy2(jpg_file_path, photo_destination / f"{new_filename}.jpg")
-            shutil.copy2(file_path, photo_destination / f"{new_filename}{suffix}")
+            for source_file, extension in ((jpg_file_path, ".jpg"), (file_path, suffix)):
+                destination_file = photo_destination / f"{new_filename}{extension}"
+                shutil.copy2(source_file, destination_file)
+                destination_file.chmod(0o644)
             summary.successful_photo_import.append(str(file_path))
 
         else:
